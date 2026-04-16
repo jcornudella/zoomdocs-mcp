@@ -29,10 +29,38 @@ import {
 } from './browser/transport.js';
 import { defaultCaptureFilePath } from './zoomdocs/capture.js';
 import { ZoomDocsService } from './zoomdocs/service.js';
+import { runVersionCheck } from './version-check.js';
 
-const VERSION = '0.1.0';
 const CLAUDE_CONFIG_PATH_ENV = 'ZOOMDOCS_MCP_CLAUDE_CONFIG_PATH';
 const PACKAGE_SPEC_ENV = 'ZOOMDOCS_MCP_PACKAGE_SPEC';
+const VERSION_CHECK_OPT_OUT_ENV = 'ZOOMDOCS_MCP_DISABLE_VERSION_CHECK';
+
+let cachedPackageMetadata: { name: string; version: string } | null = null;
+
+async function readPackageMetadata(): Promise<{ name: string; version: string }> {
+  if (cachedPackageMetadata) return cachedPackageMetadata;
+  try {
+    const raw = await readFile(new URL('../package.json', import.meta.url), 'utf8');
+    const parsed = JSON.parse(raw) as { name?: unknown; version?: unknown };
+    cachedPackageMetadata = {
+      name: typeof parsed.name === 'string' && parsed.name ? parsed.name : '@jcornudella/zoomdocs-mcp',
+      version: typeof parsed.version === 'string' && parsed.version ? parsed.version : '0.0.0',
+    };
+  } catch {
+    cachedPackageMetadata = { name: '@jcornudella/zoomdocs-mcp', version: '0.0.0' };
+  }
+  return cachedPackageMetadata;
+}
+
+async function getVersion(): Promise<string> {
+  return (await readPackageMetadata()).version;
+}
+
+function versionCheckDisabled(): boolean {
+  const value = process.env[VERSION_CHECK_OPT_OUT_ENV];
+  if (!value) return false;
+  return value === '1' || value.toLowerCase() === 'true';
+}
 
 function toStructuredContent(value: unknown): Record<string, unknown> {
   return JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
@@ -105,19 +133,7 @@ async function resolvePackageSpec(): Promise<string> {
   if (process.env[PACKAGE_SPEC_ENV]) {
     return process.env[PACKAGE_SPEC_ENV] as string;
   }
-
-  try {
-    const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as {
-      name?: unknown;
-    };
-    if (typeof packageJson.name === 'string' && packageJson.name.trim()) {
-      return packageJson.name;
-    }
-  } catch {
-    // fall back to the current local package name
-  }
-
-  return '@jcornudella/zoomdocs-mcp';
+  return (await readPackageMetadata()).name;
 }
 
 async function pathExists(filePath: string): Promise<boolean> {
@@ -296,12 +312,39 @@ async function runDoctor(): Promise<void> {
     await rm(tempProfileDir, { recursive: true, force: true });
   }
 
+  const { name: packageName, version: currentVersion } = await readPackageMetadata();
+
+  let versionStatus: string;
+  let versionOutdated = false;
+  if (versionCheckDisabled()) {
+    versionStatus = `skipped (${VERSION_CHECK_OPT_OUT_ENV}=1)`;
+  } else {
+    const versionResult = await runVersionCheck({ packageName, currentVersion });
+    if (versionResult.latest == null) {
+      versionStatus = 'could not reach npm registry';
+    } else if (versionResult.outdated) {
+      versionStatus = `update available: ${versionResult.current} -> ${versionResult.latest}`;
+      versionOutdated = true;
+    } else {
+      versionStatus = `up to date (${versionResult.current})`;
+    }
+  }
+
   const lines = [
-    `Zoom Docs MCP doctor (${VERSION})`,
+    `Zoom Docs MCP doctor (${currentVersion})`,
     `- Claude Desktop config: ${claudeConfigStatus}`,
     `- Browser launch: ${browserStatus}`,
     `- Local Zoom session profile: ${config.userDataDir}`,
+    `- Package version: ${versionStatus}`,
   ];
+
+  if (versionOutdated) {
+    lines.push(
+      '',
+      `Upgrade: quit Claude Desktop and relaunch it (the npx-based config will fetch the latest on next launch).`,
+      `If you installed via 'setup claude --local', run 'git pull && npm install && npm run build' in the local checkout.`
+    );
+  }
 
   process.stdout.write(`${lines.join('\n')}\n`);
   if (claudeConfigStatus.startsWith('error') || !claudeConfigCompatible || browserStatus !== 'ok') {
@@ -324,14 +367,30 @@ function printHelp(): void {
   );
 }
 
+async function emitVersionWarningIfOutdated(): Promise<void> {
+  if (versionCheckDisabled()) return;
+  try {
+    const { name: packageName, version: currentVersion } = await readPackageMetadata();
+    const result = await runVersionCheck({ packageName, currentVersion });
+    if (result.notice) {
+      process.stderr.write(`[zoomdocs-mcp] ${result.notice}\n`);
+    }
+  } catch {
+    // Best-effort; never block startup on version-check failures.
+  }
+}
+
 async function runMcpServer() {
   const config = getRuntimeConfig();
   const transport = new PlaywrightZoomDocsTransport(config);
   const service = new ZoomDocsService(transport);
 
+  void emitVersionWarningIfOutdated();
+
+  const { version: currentVersion } = await readPackageMetadata();
   const server = new McpServer({
     name: 'zoomdocs-mcp',
-    version: VERSION,
+    version: currentVersion,
   });
 
   server.registerTool(
@@ -772,7 +831,7 @@ async function main(argv = process.argv.slice(2)) {
   }
 
   if (argv[0] === '--version' || argv[0] === 'version') {
-    process.stdout.write(`${VERSION}\n`);
+    process.stdout.write(`${await getVersion()}\n`);
     return;
   }
 
