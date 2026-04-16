@@ -1,0 +1,43 @@
+{
+  "blocks": {
+    "page": {
+      "id": "page",
+      "type": "BLOCK_TYPE_PAGE",
+      "content": {
+        "title": "Seed Changes"
+      },
+      "seq": "a0"
+    },
+    "paragraph": {
+      "id": "paragraph",
+      "parentId": "page",
+      "type": "BLOCK_TYPE_PARAGRAPH",
+      "content": {
+        "title": "Context paragraph"
+      },
+      "seq": "a1"
+    },
+    "image": {
+      "id": "image",
+      "parentId": "page",
+      "type": "BLOCK_TYPE_IMAGE",
+      "content": {
+        "title": "[[0,{\"attachment\":{\"attachmentId\":\"att-1\",\"name\":\"diagram.png\",\"type\":\"image/png\"}},\"meta\"]]"
+      },
+      "seq": "a2"
+    },
+    "embed": {
+      "id": "embed",
+      "parentId": "page",
+      "type": "BLOCK_TYPE_EMBED_REFERENCE",
+      "content": {
+        "title": "[]",
+        "ref": {
+          "id": "db-1",
+          "type": "EMBED_TYPE_DATABASE"
+        }
+      },
+      "seq": "a3"
+    }
+  }
+}

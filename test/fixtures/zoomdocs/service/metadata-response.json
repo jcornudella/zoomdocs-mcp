@@ -1,0 +1,11 @@
+{
+  "successItems": [
+    {
+      "id": "doc-old",
+      "title": "Existing title",
+      "fileType": "doc",
+      "parentId": "folder-1",
+      "fileLink": "https://docs.zoom.us/doc/doc-old"
+    }
+  ]
+}

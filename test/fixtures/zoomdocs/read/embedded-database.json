@@ -1,0 +1,111 @@
+{
+  "blocks": {
+    "database": {
+      "id": "db-1",
+      "type": "BLOCK_TYPE_DATABASE",
+      "content": {
+        "database": {
+          "name": "Decisions",
+          "viewOrder": [
+            {
+              "id": "view-1",
+              "seq": "a0"
+            }
+          ]
+        }
+      }
+    },
+    "table": {
+      "id": "table-1",
+      "parentId": "db-1",
+      "type": "BLOCK_TYPE_DATABASE_TABLE",
+      "content": {
+        "table": {
+          "name": "Decisions table"
+        }
+      }
+    },
+    "view": {
+      "id": "view-1",
+      "parentId": "table-1",
+      "type": "BLOCK_TYPE_DATABASE_VIEW",
+      "content": {
+        "view": {
+          "name": "Decisions",
+          "databaseId": "db-1",
+          "viewType": "VIEW_TYPE_TABLE",
+          "viewColumns": {
+            "col-1": {
+              "visible": true
+            },
+            "col-2": {
+              "visible": true
+            }
+          },
+          "columnOrder": [
+            {
+              "id": "col-1",
+              "seq": "a0"
+            },
+            {
+              "id": "col-2",
+              "seq": "a1"
+            }
+          ],
+          "rowOrder": [
+            {
+              "id": "row-1",
+              "seq": "a0"
+            }
+          ]
+        }
+      }
+    },
+    "col1": {
+      "id": "col-1",
+      "parentId": "table-1",
+      "type": "BLOCK_TYPE_DATABASE_COLUMN",
+      "content": {
+        "column": {
+          "name": "Doc",
+          "isPrimary": true,
+          "columnType": "COLUMN_TYPE_TEXT"
+        }
+      }
+    },
+    "col2": {
+      "id": "col-2",
+      "parentId": "table-1",
+      "type": "BLOCK_TYPE_DATABASE_COLUMN",
+      "content": {
+        "column": {
+          "name": "Image",
+          "columnType": "COLUMN_TYPE_ATTACHMENT"
+        }
+      }
+    },
+    "row": {
+      "id": "row-1",
+      "parentId": "table-1",
+      "type": "BLOCK_TYPE_DATABASE_ROW",
+      "content": {
+        "row": {
+          "values": {
+            "col-1": {
+              "value": "{\"text\":\"https://docs.zoom.us/doc/abc123\"}"
+            },
+            "col-2": {
+              "value": [
+                {
+                  "attachmentId": "att-db",
+                  "name": "db-image.png",
+                  "type": "image/png"
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

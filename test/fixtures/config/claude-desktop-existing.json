@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem"]
+    },
+    "zoomdocs": {
+      "command": "npx",
+      "args": ["-y", "@jcornudella/zoomdocs-mcp"],
+      "env": {
+        "ZOOMDOCS_MCP_HEADLESS": "true",
+        "EXTRA_FLAG": "1"
+      }
+    }
+  },
+  "theme": "dark"
+}

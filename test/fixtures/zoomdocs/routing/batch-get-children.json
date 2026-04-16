@@ -1,0 +1,24 @@
+{
+  "successItems": [
+    {
+      "parentId": "my-docs",
+      "children": [
+        {
+          "id": "doc-aw1",
+          "title": "Seed Changes",
+          "fileType": "doc",
+          "parentId": "my-docs",
+          "fileLink": "https://aw1docs.zoom.us/doc/doc-aw1"
+        },
+        {
+          "id": "folder-eu",
+          "title": "Designs",
+          "fileType": "folder",
+          "parentId": "my-docs",
+          "fileLink": "https://eu02docs.zoom.us/folder/folder-eu",
+          "fileClusterApiPrefix": "https://eu02docs.zoom.us"
+        }
+      ]
+    }
+  ]
+}

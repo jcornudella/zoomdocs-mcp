@@ -1,0 +1,56 @@
+{
+  "name": "@jcornudella/zoomdocs-mcp",
+  "version": "0.1.0",
+  "description": "Agent-first MCP server for Zoom Docs using a persistent local browser session",
+  "author": "Joan Cornudella",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jcornudella/zoomdocs-mcp.git"
+  },
+  "homepage": "https://github.com/jcornudella/zoomdocs-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/jcornudella/zoomdocs-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "zoom",
+    "zoom-docs",
+    "claude",
+    "browser-automation"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "bin": {
+    "zoomdocs-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "verify": "npm test && npm run typecheck && npm run build",
+    "prepublishOnly": "npm run verify"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "playwright-core": "1.59.1",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "24.9.1",
+    "tsup": "8.5.1",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.4"
+  }
+}
