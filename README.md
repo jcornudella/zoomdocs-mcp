@@ -31,6 +31,14 @@ This is optimized for **Option A**:
 - `zoomdocs_read`
 - `zoomdocs_write`
 - `zoomdocs_rename`
+- `zoomdocs_delete`
+- `zoomdocs_move`
+- `zoomdocs_list_blocks`
+- `zoomdocs_append_to_block`
+- `zoomdocs_replace_block_text`
+- `zoomdocs_capture_start`
+- `zoomdocs_capture_stop`
+- `zoomdocs_capture_status`
 
 ## Important write behavior
 
@@ -39,7 +47,7 @@ This is optimized for **Option A**:
 - without `target_file_id` -> creates a new Zoom Doc from Markdown
 - with `target_file_id` -> creates a **replacement** doc under the same parent
 
-This server does **not yet** do in-place body editing of an existing doc.
+For in-place edits of an existing doc, use `zoomdocs_append_to_block` or `zoomdocs_replace_block_text` (both keep the same `fileId`). Find the right `block_id` with `zoomdocs_list_blocks` first.
 
 ## Local persistence
 
@@ -146,9 +154,22 @@ After that, the local browser profile is reused across future sessions until Zoo
 - This server relies on Zoom Docs **internal web APIs** plus the local authenticated browser session. That makes it practical for local use, but the integration may need maintenance if Zoom changes the web app.
 - This repo assumes a locally installed browser such as **Google Chrome**. It does not manage bundled browser downloads.
 - `zoomdocs_read` returns rendered Markdown from the internal document payload when available. It no longer includes the full raw internal payload in normal tool output.
-- `zoomdocs_search` currently searches document titles by walking the folder tree under `my-docs` (recursively by default). It is good enough for agent doc-resolution flows, but it is not yet a native Zoom full-text search.
+- `zoomdocs_search` uses Zoom's native `/api/search/file` endpoint, so it covers indexed title + body content across the account (not just folder title walks). Results include a `titleHighlight` string with `<em>` markers where Zoom matched the query.
 - file-cluster routing is handled conservatively and may need hardening if you hit cross-cluster docs edge cases.
 - no shared auth model is implemented in this repo; sharing is done by sharing the code, not the session.
+
+## Reverse-engineering Zoom internals (capture tool)
+
+Some Zoom Docs features (real full-text search, in-place edit on an existing doc, delete, move) are not yet implemented because the internal endpoints have not been observed. The capture tool records the real requests Zoom's web UI makes so we can replicate them from the MCP.
+
+This is primarily a development workflow, but the tools are always available — ask the agent to start a capture, drive the action in the focused browser window, then stop.
+
+1. In your agent, call `zoomdocs_capture_start`. A JSONL file path is returned, and the local browser window comes to the front at `docs.zoom.us`.
+2. In that browser window, perform the action you want to capture (e.g. type into Zoom's search box, rename a doc, drag a doc between folders, edit a paragraph).
+3. Call `zoomdocs_capture_stop`. The JSONL file now contains every `/api/*` request Zoom's UI made during the session plus any WebSocket frames (`kind: "websocket"` entries with `direction: open|sent|received|close`), with cookies and `Authorization` headers redacted. Binary WebSocket payloads are base64-encoded.
+4. Inspect the JSONL to identify the endpoint(s) involved, then wire a new MCP tool against them in `src/zoomdocs/service.ts` + `src/index.ts`.
+
+Captures live at `~/.config/zoomdocs-mcp/captures/` by default. You can override with the `output_path` input on `zoomdocs_capture_start`.
 
 ## Development
 

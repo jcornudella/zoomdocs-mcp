@@ -15,6 +15,7 @@ import {
   buildClaudeDesktopServerConfig,
   detectClaudeDesktopServerMode,
   getClaudeDesktopConfigPath,
+  getConfigPaths,
   getRuntimeConfig,
   type ClaudeDesktopConfig,
   type ClaudeDesktopSetupMode,
@@ -26,6 +27,7 @@ import {
   formatBrowserLaunchError,
   PlaywrightZoomDocsTransport,
 } from './browser/transport.js';
+import { defaultCaptureFilePath } from './zoomdocs/capture.js';
 import { ZoomDocsService } from './zoomdocs/service.js';
 
 const VERSION = '0.1.0';
@@ -49,22 +51,36 @@ function formatListText(parentId: string, items: Array<{ id: string; title: stri
 
 function formatSearchText(result: {
   query: string;
-  parentId: string;
-  scannedFolders: number;
-  scannedItems: number;
-  truncated: boolean;
-  items: Array<{ id: string; title: string; fileType: string; fileLink?: string; score: number }>;
+  pageSize: number;
+  fileTypes: string[];
+  totalReturned: number;
+  items: Array<{
+    id: string;
+    title: string;
+    fileType: string;
+    fileLink: string;
+    titleHighlight?: string;
+    updatedAt?: string;
+    updatedByDisplayName?: string;
+  }>;
 }) {
   if (result.items.length === 0) {
-    return `No Zoom Docs matches found for "${result.query}" under ${result.parentId}. Scanned ${result.scannedFolders} folders / ${result.scannedItems} items.`;
+    return `No Zoom Docs matches found for "${result.query}" (file types: ${result.fileTypes.join(', ')}).`;
   }
 
   return [
-    `Search results for "${result.query}" under ${result.parentId}:`,
-    ...result.items.map(
-      (item) => `- [${item.fileType}] ${item.title} — ${item.id} — score ${item.score}${item.fileLink ? ` — ${item.fileLink}` : ''}`
-    ),
-    `Scanned ${result.scannedFolders} folders / ${result.scannedItems} items.${result.truncated ? ' Stopped early at the search safety limit.' : ''}`,
+    `Search results for "${result.query}" (${result.totalReturned} of up to ${result.pageSize}):`,
+    ...result.items.map((item) => {
+      const display = item.titleHighlight || item.title;
+      const updatedBits = [
+        item.updatedAt ? `updated ${item.updatedAt}` : undefined,
+        item.updatedByDisplayName ? `by ${item.updatedByDisplayName}` : undefined,
+      ]
+        .filter(Boolean)
+        .join(' ');
+      const trailing = updatedBits ? ` — ${updatedBits}` : '';
+      return `- [${item.fileType}] ${display} — ${item.id} — ${item.fileLink}${trailing}`;
+    }),
   ].join('\n');
 }
 
@@ -364,20 +380,34 @@ async function runMcpServer() {
     {
       title: 'Zoom Docs Search',
       description:
-        'Use this first when the user mentions a Zoom Doc by name or topic but does not provide an exact file ID or URL. Searches titles under my-docs (recursively by default) so the agent can resolve the right doc before reading or writing.',
+        'Use this first when the user mentions a Zoom Doc by name, topic, or content but does not provide an exact file ID or URL. Runs native Zoom Docs full-text search across the account (titles and body content as indexed by Zoom) and returns ranked results so the agent can resolve the right doc before reading or writing.',
       inputSchema: {
-        query: z.string().describe('Natural-language title fragment or doc name to search for.'),
-        parent_id: z.string().optional().describe('Optional folder ID or Zoom Docs folder URL to scope the search. Defaults to my-docs.'),
-        recursive: z.boolean().optional().describe('Whether to descend into nested folders. Defaults to true.'),
-        max_results: z.number().int().min(1).max(25).optional().describe('Maximum number of results to return. Defaults to 10.'),
+        query: z.string().describe('Natural-language query to search for. Matches titles and indexed body content.'),
+        page_size: z
+          .number()
+          .int()
+          .min(1)
+          .max(50)
+          .optional()
+          .describe('Maximum number of results to return (1-50). Defaults to 10.'),
+        file_types: z
+          .array(z.enum(['doc', 'classicDoc', 'page', 'database', 'folder']))
+          .optional()
+          .describe(
+            'Restrict results by Zoom file type. Defaults to ["database","classicDoc","doc","page"] which matches the Zoom Docs UI behavior.'
+          ),
+        include_deleted: z
+          .boolean()
+          .optional()
+          .describe('Include docs that have been moved to trash. Defaults to false.'),
       },
     },
-    async ({ query, parent_id, recursive, max_results }) => {
+    async ({ query, page_size, file_types, include_deleted }) => {
       const result = await service.search({
         query,
-        parentId: parent_id,
-        recursive,
-        maxResults: max_results,
+        pageSize: page_size,
+        fileTypes: file_types,
+        includeDeleted: include_deleted,
       });
 
       return {
@@ -469,6 +499,209 @@ async function runMcpServer() {
 
       return {
         content: [{ type: 'text', text }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  server.registerTool(
+    'zoomdocs_capture_start',
+    {
+      title: 'Zoom Docs Capture: start',
+      description:
+        'Start recording Zoom Docs internal HTTP traffic from the local browser session to a JSONL file for offline inspection. Invoke this when the user asks to capture, record, or trace Zoom Docs network calls (for example to reverse-engineer endpoints for search/edit/delete/move). This is safe to run: cookies and Authorization headers are redacted, the local browser is simply brought to the foreground, and nothing is sent anywhere. Stop with zoomdocs_capture_stop.',
+      inputSchema: {
+        output_path: z
+          .string()
+          .optional()
+          .describe(
+            'Absolute path for the JSONL capture file. Defaults to ~/.config/zoomdocs-mcp/captures/capture-<timestamp>.jsonl.'
+          ),
+      },
+    },
+    async ({ output_path }) => {
+      const capturesDir = path.join(getConfigPaths().configDir, 'captures');
+      const outputPath = output_path || defaultCaptureFilePath({ capturesDir });
+      const result = await service.captureStart({ outputPath });
+      return {
+        content: [
+          {
+            type: 'text',
+            text: [
+              `Zoom Docs capture started. Writing JSONL to ${result.outputPath}.`,
+              'Perform the action you want to reverse-engineer (search, edit, delete, move, etc.) in the browser window that was focused.',
+              'When finished, call zoomdocs_capture_stop.',
+            ].join('\n'),
+          },
+        ],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  server.registerTool(
+    'zoomdocs_capture_stop',
+    {
+      title: 'Zoom Docs Capture: stop',
+      description:
+        'Stop the currently running Zoom Docs capture and return the JSONL file path plus entry count. Invoke this when the user says they are done capturing, or asks to stop/finish the trace.',
+      inputSchema: {},
+    },
+    async () => {
+      const result = await service.captureStop();
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Zoom Docs capture stopped. ${result.entriesWritten} entries written to ${result.outputPath}.`,
+          },
+        ],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  server.registerTool(
+    'zoomdocs_capture_status',
+    {
+      title: 'Zoom Docs Capture: status',
+      description:
+        'Report whether a Zoom Docs capture session is active and how many entries have been written. Invoke when the user asks about capture status or wants to check if recording is on.',
+      inputSchema: {},
+    },
+    async () => {
+      const result = service.captureStatus();
+      return {
+        content: [
+          {
+            type: 'text',
+            text: result.active
+              ? `Zoom Docs capture active since ${result.startedAt}. ${result.entriesWritten} entries written so far to ${result.outputPath}.`
+              : 'Zoom Docs capture is not running.',
+          },
+        ],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  server.registerTool(
+    'zoomdocs_delete',
+    {
+      title: 'Zoom Docs Delete',
+      description:
+        'Move a Zoom Doc (or folder) to the trash. Invoke when the user asks to delete, trash, or remove a specific Zoom Docs file. The file is moved to trash, not hard-deleted, so it can typically be restored from the Zoom Docs UI.',
+      inputSchema: {
+        file_id: z.string().describe('Zoom Docs file ID or URL to trash.'),
+      },
+    },
+    async ({ file_id }) => {
+      const result = await service.deleteFile({ fileId: file_id });
+      return {
+        content: [{ type: 'text', text: `Moved ${result.fileId} to trash.` }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  server.registerTool(
+    'zoomdocs_move',
+    {
+      title: 'Zoom Docs Move',
+      description:
+        'Move a Zoom Doc (or folder) under a different parent folder. Invoke when the user asks to move, relocate, or reorganize a file into another folder.',
+      inputSchema: {
+        file_id: z.string().describe('Zoom Docs file ID or URL to move.'),
+        parent_id: z
+          .string()
+          .describe('Destination parent folder ID or URL. Use "my-docs" for the root of the user\'s personal space.'),
+      },
+    },
+    async ({ file_id, parent_id }) => {
+      const result = await service.moveFile({ fileId: file_id, parentId: parent_id });
+      return {
+        content: [{ type: 'text', text: `Moved ${result.fileId} under parent ${result.newParentId}.` }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  server.registerTool(
+    'zoomdocs_list_blocks',
+    {
+      title: 'Zoom Docs List Blocks',
+      description:
+        'List every block inside a Zoom Doc with its ID, type, text, version, and parent. Invoke this when the user wants to edit part of an existing doc so you can pick the right block_id for zoomdocs_append_to_block or zoomdocs_replace_block_text.',
+      inputSchema: {
+        file_id: z.string().describe('Zoom Docs file ID or URL.'),
+      },
+    },
+    async ({ file_id }) => {
+      const result = await service.listBlocks({ fileId: file_id });
+      const preview = result.blocks
+        .slice(0, 40)
+        .map((block) => `${block.id} [${block.type} v${block.version}] ${block.text.slice(0, 80)}`)
+        .join('\n');
+      const suffix = result.blocks.length > 40 ? `\n… ${result.blocks.length - 40} more blocks` : '';
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Zoom Doc ${result.fileId} has ${result.blocks.length} blocks:\n${preview}${suffix}`,
+          },
+        ],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  server.registerTool(
+    'zoomdocs_append_to_block',
+    {
+      title: 'Zoom Docs Append To Block',
+      description:
+        'Append text to the end of an existing block in a Zoom Doc, in place (no replacement doc is created). Invoke this when the user asks to add to / extend / tack on content to a specific paragraph, heading, or list item. Use zoomdocs_list_blocks first to find the right block_id. Non-text inline content in the block (attachments, links, mentions) is preserved.',
+      inputSchema: {
+        file_id: z.string().describe('Zoom Docs file ID or URL.'),
+        block_id: z.string().describe('Block ID inside the doc, from zoomdocs_list_blocks.'),
+        text: z.string().min(1).describe('Plain text to append to the block.'),
+      },
+    },
+    async ({ file_id, block_id, text }) => {
+      const result = await service.appendToBlock({ fileId: file_id, blockId: block_id, text });
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Appended ${text.length} chars to block ${result.blockId} (v${result.previousVersion} -> v${result.newVersion}).`,
+          },
+        ],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  server.registerTool(
+    'zoomdocs_replace_block_text',
+    {
+      title: 'Zoom Docs Replace Block Text',
+      description:
+        'Replace the entire text content of an existing block in a Zoom Doc, in place. Invoke this when the user asks to rewrite, edit, or overwrite a specific paragraph, heading, or list item. Use zoomdocs_list_blocks first to find the right block_id. WARNING: any existing inline objects (attachments, links, mentions) inside that block will be removed; only plain text remains.',
+      inputSchema: {
+        file_id: z.string().describe('Zoom Docs file ID or URL.'),
+        block_id: z.string().describe('Block ID inside the doc, from zoomdocs_list_blocks.'),
+        text: z.string().describe('New plain text for the block. Pass an empty string to clear the block.'),
+      },
+    },
+    async ({ file_id, block_id, text }) => {
+      const result = await service.replaceBlockText({ fileId: file_id, blockId: block_id, text });
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Replaced block ${result.blockId} (v${result.previousVersion} -> v${result.newVersion}) with ${text.length} chars.`,
+          },
+        ],
         structuredContent: toStructuredContent(result),
       };
     }

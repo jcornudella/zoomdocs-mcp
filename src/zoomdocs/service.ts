@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import {
   buildSyncCreatePayload,
   decodeContentData,
@@ -8,6 +10,15 @@ import {
   type ParsedModocContent,
   type ZoomDocsNode,
 } from './internal-api.js';
+import {
+  buildAppendDelta,
+  buildBlockTransactionRequest,
+  buildReplaceDelta,
+  computeBlockTextLength,
+  summarizeBlocks,
+  type BlockSummary,
+  type RawBlockSummary,
+} from './edit.js';
 import {
   collectAttachmentRefs,
   collectEmbeddedDatabaseRefs,
@@ -25,10 +36,32 @@ export interface RequestJsonOptions {
   headers?: Record<string, string>;
 }
 
+export interface CaptureStartResult {
+  outputPath: string;
+  startedAt: string;
+}
+
+export interface CaptureStopResult {
+  outputPath: string;
+  entriesWritten: number;
+  startedAt: string;
+  stoppedAt: string;
+}
+
+export interface CaptureStatusResult {
+  active: boolean;
+  outputPath: string | null;
+  startedAt: string | null;
+  entriesWritten: number;
+}
+
 export interface ZoomDocsTransport {
   ensureLoggedIn(interactive: boolean): Promise<void>;
   openLogin(): Promise<{ alreadyAuthenticated: boolean }>;
   requestJson<T>(options: RequestJsonOptions): Promise<T>;
+  startCapture(options: { outputPath: string }): Promise<CaptureStartResult>;
+  stopCapture(): Promise<CaptureStopResult>;
+  captureStatus(): CaptureStatusResult;
 }
 
 export interface ListResult {
@@ -36,19 +69,77 @@ export interface ListResult {
   items: ZoomDocsNode[];
 }
 
-export interface SearchResultItem extends ZoomDocsNode {
-  score: number;
+export const DEFAULT_SEARCH_FILE_TYPES = ['database', 'classicDoc', 'doc', 'page'] as const;
+export const DEFAULT_SEARCH_PAGE_SIZE = 10;
+export const MAX_SEARCH_PAGE_SIZE = 50;
+
+export interface SearchResultItem {
+  id: string;
+  title: string;
+  fileType: string;
+  parentId?: string;
+  fileLink: string;
+  isDeleted: boolean;
+  titleHighlight?: string;
+  updatedAt?: string;
+  updatedByDisplayName?: string;
 }
 
 export interface SearchResult {
   query: string;
-  parentId: string;
-  recursive: boolean;
-  maxResults: number;
-  scannedFolders: number;
-  scannedItems: number;
-  truncated: boolean;
+  pageSize: number;
+  fileTypes: string[];
+  totalReturned: number;
   items: SearchResultItem[];
+}
+
+export interface RawZoomSearchItem {
+  file?: {
+    id?: string;
+    title?: string;
+    fileType?: string;
+    parentId?: string;
+    isDeleted?: boolean;
+    createdInfo?: { user?: { displayName?: string }; time?: string };
+    updatedInfo?: { user?: { displayName?: string }; time?: string };
+  };
+  highlight?: { titleHighlight?: string };
+}
+
+export function buildZoomDocFileLink(
+  fileType: string,
+  id: string,
+  baseUrl = 'https://docs.zoom.us'
+): string {
+  if (fileType === 'folder') return `${baseUrl}/folder/${id}`;
+  if (fileType === 'database') return `${baseUrl}/database/${id}`;
+  return `${baseUrl}/doc/${id}`;
+}
+
+export function stripTitleHighlightMarkup(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  return value.replace(/<\/?em>/gi, '') || undefined;
+}
+
+export function normalizeNativeSearchItem(entry: RawZoomSearchItem): SearchResultItem | null {
+  const file = entry.file;
+  if (!file?.id) return null;
+
+  const fileType = String(file.fileType ?? 'unknown');
+  return {
+    id: String(file.id),
+    title: String(file.title ?? ''),
+    fileType,
+    parentId: typeof file.parentId === 'string' ? file.parentId : undefined,
+    fileLink: buildZoomDocFileLink(fileType, String(file.id)),
+    isDeleted: Boolean(file.isDeleted),
+    titleHighlight: entry.highlight?.titleHighlight || undefined,
+    updatedAt: typeof file.updatedInfo?.time === 'string' ? file.updatedInfo.time : undefined,
+    updatedByDisplayName:
+      typeof file.updatedInfo?.user?.displayName === 'string'
+        ? file.updatedInfo.user.displayName
+        : undefined,
+  };
 }
 
 export interface ReadResult {
@@ -65,42 +156,34 @@ export interface WriteMarkdownResult {
   replacedFileId?: string;
 }
 
-function normalizeSearchText(value: string): string {
-  return value
-    .toLowerCase()
-    .normalize('NFKD')
-    .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+export interface ListBlocksResult {
+  fileId: string;
+  blocks: BlockSummary[];
 }
 
-function scoreSearchCandidate(title: string, query: string): number {
-  const normalizedTitle = normalizeSearchText(title);
-  const normalizedQuery = normalizeSearchText(query);
-
-  if (!normalizedTitle || !normalizedQuery) return 0;
-  if (normalizedTitle === normalizedQuery) return 1000;
-  if (normalizedTitle.startsWith(normalizedQuery)) return 800;
-  if (normalizedTitle.includes(normalizedQuery)) return 700;
-
-  const queryTokens = normalizedQuery.split(' ').filter(Boolean);
-  const matchingTokens = queryTokens.filter((token) => normalizedTitle.includes(token));
-  if (matchingTokens.length === 0) return 0;
-
-  return 400 + matchingTokens.length * 50 - Math.max(0, normalizedTitle.length - normalizedQuery.length);
+export interface EditBlockResult {
+  fileId: string;
+  blockId: string;
+  previousVersion: number;
+  newVersion: number;
+  newTextLength: number;
 }
 
-function rankSearchResults(items: SearchResultItem[]): SearchResultItem[] {
-  return [...items].sort((left, right) => {
-    if (right.score !== left.score) return right.score - left.score;
-    if (left.fileType !== right.fileType) {
-      return left.fileType === 'folder' ? 1 : -1;
-    }
-    return left.title.localeCompare(right.title);
-  });
+export interface DeleteFileResult {
+  fileId: string;
+  status: 'trashed';
+}
+
+export interface MoveFileResult {
+  fileId: string;
+  newParentId: string;
 }
 
 export class ZoomDocsService {
+  private cachedUserId: string | null = null;
+  private cachedAccountId: string | null = null;
+  private readonly clientId: string = randomUUID();
+
   constructor(private readonly transport: ZoomDocsTransport) {}
 
   async login(): Promise<{ status: 'already_authenticated' | 'login_opened' }> {
@@ -155,73 +238,47 @@ export class ZoomDocsService {
 
   async search({
     query,
-    parentId,
-    recursive = true,
-    maxResults = 10,
+    pageSize = DEFAULT_SEARCH_PAGE_SIZE,
+    fileTypes,
+    includeDeleted = false,
   }: {
     query: string;
-    parentId?: string;
-    recursive?: boolean;
-    maxResults?: number;
+    pageSize?: number;
+    fileTypes?: readonly string[];
+    includeDeleted?: boolean;
   }): Promise<SearchResult> {
     const normalizedQuery = query.trim();
     if (!normalizedQuery) {
       throw new Error('query is required');
     }
 
-    const resolvedParentId = extractFileId(parentId || 'my-docs');
-    const queue = [resolvedParentId];
-    const visited = new Set<string>();
-    const matches = new Map<string, SearchResultItem>();
-    let scannedFolders = 0;
-    let scannedItems = 0;
-    let truncated = false;
-    const maxFolders = 200;
+    const resolvedFileTypes =
+      fileTypes && fileTypes.length > 0 ? [...fileTypes] : [...DEFAULT_SEARCH_FILE_TYPES];
+    const clampedPageSize = Math.min(Math.max(Math.round(pageSize), 1), MAX_SEARCH_PAGE_SIZE);
 
-    while (queue.length > 0) {
-      const currentParentId = queue.shift();
-      if (!currentParentId || visited.has(currentParentId)) continue;
-      if (scannedFolders >= maxFolders) {
-        truncated = true;
-        break;
-      }
+    const payload = await this.transport.requestJson<{ items?: RawZoomSearchItem[] }>({
+      method: 'POST',
+      path: '/api/search/file',
+      body: {
+        pageSize: clampedPageSize,
+        query: normalizedQuery,
+        fileTypes: resolvedFileTypes,
+      },
+    });
 
-      visited.add(currentParentId);
-      scannedFolders += 1;
-
-      const payload = await this.transport.requestJson<{
-        successItems?: Array<{ children?: Array<Record<string, unknown>> }>;
-      }>({
-        method: 'POST',
-        path: '/api/file/files/action/batch_get_children',
-        body: { parentIds: [currentParentId] },
-        fileId: currentParentId,
-      });
-
-      const items = normalizeBatchGetChildrenResult(payload);
-      scannedItems += items.length;
-
-      for (const item of items) {
-        const score = scoreSearchCandidate(item.title, normalizedQuery);
-        if (score > 0) {
-          matches.set(item.id, { ...item, score });
-        }
-
-        if (recursive && item.fileType === 'folder' && !visited.has(item.id)) {
-          queue.push(item.id);
-        }
-      }
-    }
+    const items = (payload.items ?? []).flatMap((entry) => {
+      const normalized = normalizeNativeSearchItem(entry);
+      if (!normalized) return [];
+      if (!includeDeleted && normalized.isDeleted) return [];
+      return [normalized];
+    });
 
     return {
       query: normalizedQuery,
-      parentId: resolvedParentId,
-      recursive,
-      maxResults,
-      scannedFolders,
-      scannedItems,
-      truncated,
-      items: rankSearchResults([...matches.values()]).slice(0, Math.max(1, maxResults)),
+      pageSize: clampedPageSize,
+      fileTypes: resolvedFileTypes,
+      totalReturned: items.length,
+      items,
     };
   }
 
@@ -404,6 +461,21 @@ export class ZoomDocsService {
     };
   }
 
+  async captureStart({ outputPath }: { outputPath: string }): Promise<CaptureStartResult> {
+    if (!outputPath) {
+      throw new Error('outputPath is required for captureStart');
+    }
+    return this.transport.startCapture({ outputPath });
+  }
+
+  async captureStop(): Promise<CaptureStopResult> {
+    return this.transport.stopCapture();
+  }
+
+  captureStatus(): CaptureStatusResult {
+    return this.transport.captureStatus();
+  }
+
   async rename({ fileId, title }: { fileId: string; title: string }): Promise<{ ok: true }> {
     const resolvedFileId = extractFileId(fileId);
     const normalizedTitle = title.trim();
@@ -419,5 +491,175 @@ export class ZoomDocsService {
     });
 
     return { ok: true };
+  }
+
+  async listBlocks({ fileId }: { fileId: string }): Promise<ListBlocksResult> {
+    const resolvedFileId = extractFileId(fileId);
+    const blocks = await this.fetchBlocks(resolvedFileId);
+    return { fileId: resolvedFileId, blocks: summarizeBlocks(blocks, { rootId: resolvedFileId }) };
+  }
+
+  async appendToBlock({
+    fileId,
+    blockId,
+    text,
+  }: {
+    fileId: string;
+    blockId: string;
+    text: string;
+  }): Promise<EditBlockResult> {
+    if (!text) {
+      throw new Error('text must be a non-empty string');
+    }
+    return this.submitBlockEdit({ fileId, blockId, mode: 'append', text });
+  }
+
+  async replaceBlockText({
+    fileId,
+    blockId,
+    text,
+  }: {
+    fileId: string;
+    blockId: string;
+    text: string;
+  }): Promise<EditBlockResult> {
+    return this.submitBlockEdit({ fileId, blockId, mode: 'replace', text });
+  }
+
+  private async submitBlockEdit({
+    fileId,
+    blockId,
+    mode,
+    text,
+  }: {
+    fileId: string;
+    blockId: string;
+    mode: 'append' | 'replace';
+    text: string;
+  }): Promise<EditBlockResult> {
+    const resolvedFileId = extractFileId(fileId);
+    const blocks = await this.fetchBlocks(resolvedFileId);
+    const block = blocks[blockId];
+    if (!block) {
+      throw new Error(`Block not found in ${resolvedFileId}: ${blockId}`);
+    }
+    const baseVersion = typeof block.version === 'number' ? block.version : 0;
+    const currentLength = computeBlockTextLength(block.content?.title);
+    const userId = await this.getCurrentUserId();
+
+    const delta =
+      mode === 'append'
+        ? buildAppendDelta({ currentLength, text, userId })
+        : buildReplaceDelta({ currentLength, text, userId });
+
+    const body = buildBlockTransactionRequest({
+      fileId: resolvedFileId,
+      clientId: this.clientId,
+      baseVersion,
+      blockId,
+      delta,
+      reqId: randomUUID(),
+      transactionId: randomUUID(),
+    });
+
+    const encodedFileId = encodeURIComponent(resolvedFileId);
+    await this.transport.requestJson({
+      method: 'POST',
+      path: `/api/block/transactions?fileId=${encodedFileId}`,
+      body,
+      fileId: resolvedFileId,
+    });
+
+    const newTextLength = mode === 'append' ? currentLength + text.length : text.length;
+    return {
+      fileId: resolvedFileId,
+      blockId,
+      previousVersion: baseVersion,
+      newVersion: baseVersion + 1,
+      newTextLength,
+    };
+  }
+
+  private async fetchBlocks(fileId: string): Promise<Record<string, RawBlockSummary>> {
+    const encodedFileId = encodeURIComponent(fileId);
+    const payload = await this.transport.requestJson<{ content?: { data?: string; gzip?: boolean } }>({
+      method: 'GET',
+      path: `/api/page/${encodedFileId}/content?returnEncodedData=true&fileId=${encodedFileId}`,
+      fileId,
+    });
+
+    const encoded = payload.content?.data;
+    if (!encoded) {
+      throw new Error(`Zoom Docs content payload missing for ${fileId}`);
+    }
+
+    const raw = decodeContentData(encoded, Boolean(payload.content?.gzip));
+    const parsed = JSON.parse(raw) as { blocks?: Record<string, RawBlockSummary> };
+    return parsed.blocks ?? {};
+  }
+
+  private async getCurrentUserId(): Promise<string> {
+    if (this.cachedUserId) return this.cachedUserId;
+    await this.loadCurrentUser();
+    if (!this.cachedUserId) {
+      throw new Error('Could not resolve current user id from /api/user/me');
+    }
+    return this.cachedUserId;
+  }
+
+  private async getCurrentAccountId(): Promise<string> {
+    if (this.cachedAccountId) return this.cachedAccountId;
+    await this.loadCurrentUser();
+    if (!this.cachedAccountId) {
+      throw new Error('Could not resolve current account id from /api/user/me');
+    }
+    return this.cachedAccountId;
+  }
+
+  private async loadCurrentUser(): Promise<void> {
+    const payload = await this.transport.requestJson<{
+      user?: { userId?: string; accountId?: string };
+      account?: { accountId?: string };
+    }>({
+      method: 'GET',
+      path: '/api/user/me',
+    });
+    if (payload.user?.userId) this.cachedUserId = payload.user.userId;
+    const accountId = payload.account?.accountId ?? payload.user?.accountId;
+    if (accountId) this.cachedAccountId = accountId;
+  }
+
+  async deleteFile({ fileId }: { fileId: string }): Promise<DeleteFileResult> {
+    const resolvedFileId = extractFileId(fileId);
+    const accountId = await this.getCurrentAccountId();
+    await this.transport.requestJson({
+      method: 'POST',
+      path: '/api/file/files/action/delete_to_trash',
+      body: { ids: [resolvedFileId], accountId },
+      fileId: resolvedFileId,
+    });
+    return { fileId: resolvedFileId, status: 'trashed' };
+  }
+
+  async moveFile({
+    fileId,
+    parentId,
+  }: {
+    fileId: string;
+    parentId: string;
+  }): Promise<MoveFileResult> {
+    const resolvedFileId = extractFileId(fileId);
+    const resolvedParentId = extractFileId(parentId);
+    if (!resolvedParentId) {
+      throw new Error('parent_id is required');
+    }
+    const accountId = await this.getCurrentAccountId();
+    await this.transport.requestJson({
+      method: 'POST',
+      path: '/api/file/files/action/move',
+      body: { ids: [resolvedFileId], parentId: resolvedParentId, accountId },
+      fileId: resolvedFileId,
+    });
+    return { fileId: resolvedFileId, newParentId: resolvedParentId };
   }
 }

@@ -1,10 +1,16 @@
 import { mkdir } from 'node:fs/promises';
-import { chromium, type BrowserContext, type Page } from 'playwright-core';
+import { chromium, type BrowserContext, type Page, type Request, type WebSocket } from 'playwright-core';
 
 import type { RuntimeConfig } from '../config.js';
 import type { RequestJsonOptions } from '../zoomdocs/service.js';
+import { CaptureRecorder, shouldRecordRequest } from '../zoomdocs/capture.js';
 import { collectRememberableNodes, type ZoomDocsNode } from '../zoomdocs/internal-api.js';
 import { buildApiReplayHeaders, buildCandidateDocsOrigins, parseCsrfTokenResponse, toAbsoluteUrl } from './helpers.js';
+import {
+  removeSingletonLockIfExists,
+  resolveSingletonLockState,
+  singletonLockPath,
+} from './profile-lock.js';
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -68,6 +74,9 @@ export class PlaywrightZoomDocsTransport {
   private apiReplayHeaders: Record<string, string> = {};
   private readonly instrumentedPages = new WeakSet<Page>();
   private readonly fileHostById = new Map<string, string>();
+  private captureRecorder: CaptureRecorder | null = null;
+  private captureDetach: (() => void) | null = null;
+  private captureStartedAt: string | null = null;
 
   constructor(private readonly config: RuntimeConfig) {}
 
@@ -85,11 +94,213 @@ export class PlaywrightZoomDocsTransport {
   }
 
   async dispose() {
+    if (this.captureRecorder) {
+      this.captureDetach?.();
+      this.captureDetach = null;
+      await this.captureRecorder.close();
+      this.captureRecorder = null;
+      this.captureStartedAt = null;
+    }
+
     const context = this.contextPromise ? await this.contextPromise : null;
     await context?.close();
     this.contextPromise = null;
     this.csrfTokenByOrigin.clear();
     this.preferredBaseUrl = null;
+
+    await removeSingletonLockIfExists(singletonLockPath(this.config.userDataDir)).catch(() => undefined);
+  }
+
+  isCapturing(): boolean {
+    return this.captureRecorder !== null;
+  }
+
+  async startCapture({
+    outputPath,
+  }: {
+    outputPath: string;
+  }): Promise<{ outputPath: string; startedAt: string }> {
+    if (this.captureRecorder) {
+      throw new Error(
+        `Zoom Docs capture is already running at ${this.captureRecorder.outputPath}. Call stopCapture first.`
+      );
+    }
+
+    const context = await this.getContext(true);
+    const recorder = new CaptureRecorder(outputPath);
+
+    const detachCallbacks: Array<() => void> = [];
+    const trackedWebSockets = new WeakSet<WebSocket>();
+
+    const attachWebSocket = (ws: WebSocket, page: Page) => {
+      if (trackedWebSockets.has(ws)) return;
+      trackedWebSockets.add(ws);
+
+      const fromPageUrl = page.url() || undefined;
+
+      recorder
+        .recordWebSocket({
+          frame: { url: ws.url(), direction: 'open', payload: null, fromPageUrl },
+        })
+        .catch(() => undefined);
+
+      const sentHandler = (data: { payload: string | Buffer }) => {
+        recorder
+          .recordWebSocket({
+            frame: { url: ws.url(), direction: 'sent', payload: data.payload, fromPageUrl },
+          })
+          .catch(() => undefined);
+      };
+
+      const receivedHandler = (data: { payload: string | Buffer }) => {
+        recorder
+          .recordWebSocket({
+            frame: { url: ws.url(), direction: 'received', payload: data.payload, fromPageUrl },
+          })
+          .catch(() => undefined);
+      };
+
+      const closeHandler = (_ws: WebSocket) => {
+        recorder
+          .recordWebSocket({
+            frame: { url: ws.url(), direction: 'close', payload: null, fromPageUrl },
+          })
+          .catch(() => undefined);
+      };
+
+      ws.on('framesent', sentHandler);
+      ws.on('framereceived', receivedHandler);
+      ws.on('close', closeHandler);
+
+      detachCallbacks.push(() => {
+        ws.off('framesent', sentHandler);
+        ws.off('framereceived', receivedHandler);
+        ws.off('close', closeHandler);
+      });
+    };
+
+    const attachPageWebSockets = (page: Page) => {
+      const webSocketHandler = (ws: WebSocket) => attachWebSocket(ws, page);
+      page.on('websocket', webSocketHandler);
+      detachCallbacks.push(() => page.off('websocket', webSocketHandler));
+    };
+
+    for (const page of context.pages()) {
+      if (!page.isClosed()) attachPageWebSockets(page);
+    }
+
+    const newPageHandler = (page: Page) => attachPageWebSockets(page);
+    context.on('page', newPageHandler);
+    detachCallbacks.push(() => context.off('page', newPageHandler));
+
+    const finishedHandler = async (request: Request) => {
+      if (!shouldRecordRequest(request.url())) return;
+      try {
+        const response = await request.response().catch(() => null);
+        await recorder.record({
+          timestamp: new Date().toISOString(),
+          request: {
+            method: request.method(),
+            url: request.url(),
+            resourceType: request.resourceType(),
+            headers: await request.allHeaders().catch(() => ({})),
+            body: request.postData(),
+            fromPageUrl: request.frame()?.url(),
+          },
+          response: response
+            ? {
+                status: response.status(),
+                statusText: response.statusText(),
+                headers: await response.allHeaders().catch(() => ({})),
+                body: await response.text().catch(() => null),
+              }
+            : undefined,
+        });
+      } catch {
+        // best-effort; never let capture break the session
+      }
+    };
+
+    const failedHandler = async (request: Request) => {
+      if (!shouldRecordRequest(request.url())) return;
+      try {
+        await recorder.record({
+          timestamp: new Date().toISOString(),
+          request: {
+            method: request.method(),
+            url: request.url(),
+            resourceType: request.resourceType(),
+            headers: await request.allHeaders().catch(() => ({})),
+            body: request.postData(),
+            fromPageUrl: request.frame()?.url(),
+          },
+          failure: request.failure()?.errorText ?? 'unknown failure',
+        });
+      } catch {
+        // best-effort
+      }
+    };
+
+    context.on('requestfinished', finishedHandler);
+    context.on('requestfailed', failedHandler);
+    detachCallbacks.push(() => {
+      context.off('requestfinished', finishedHandler);
+      context.off('requestfailed', failedHandler);
+    });
+
+    this.captureDetach = () => {
+      for (const detach of detachCallbacks) {
+        try {
+          detach();
+        } catch {
+          // ignore teardown errors
+        }
+      }
+    };
+    this.captureRecorder = recorder;
+    this.captureStartedAt = new Date().toISOString();
+
+    const page = await this.getPage(true);
+    try {
+      if (!page.url() || page.url() === 'about:blank') {
+        await page.goto(this.config.baseUrl, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+      }
+    } catch {
+      // non-fatal; the user can navigate manually
+    }
+    await page.bringToFront().catch(() => undefined);
+
+    return { outputPath, startedAt: this.captureStartedAt };
+  }
+
+  async stopCapture(): Promise<{ outputPath: string; entriesWritten: number; startedAt: string; stoppedAt: string }> {
+    const recorder = this.captureRecorder;
+    const startedAt = this.captureStartedAt;
+    if (!recorder || !startedAt) {
+      throw new Error('No Zoom Docs capture is currently running.');
+    }
+
+    this.captureDetach?.();
+    this.captureDetach = null;
+    await recorder.close();
+    this.captureRecorder = null;
+    this.captureStartedAt = null;
+
+    return {
+      outputPath: recorder.outputPath,
+      entriesWritten: recorder.count,
+      startedAt,
+      stoppedAt: new Date().toISOString(),
+    };
+  }
+
+  captureStatus(): { active: boolean; outputPath: string | null; startedAt: string | null; entriesWritten: number } {
+    return {
+      active: this.captureRecorder !== null,
+      outputPath: this.captureRecorder?.outputPath ?? null,
+      startedAt: this.captureStartedAt,
+      entriesWritten: this.captureRecorder?.count ?? 0,
+    };
   }
 
   async ensureLoggedIn(interactive: boolean): Promise<void> {
@@ -324,6 +535,7 @@ export class PlaywrightZoomDocsTransport {
 
   private async launchContext(interactive: boolean): Promise<BrowserContext> {
     await mkdir(this.config.userDataDir, { recursive: true });
+    await this.ensureProfileLockClear();
 
     const requestedHeadless = interactive ? false : this.config.headless;
     const launchOptions = buildLaunchOptions({
@@ -338,5 +550,28 @@ export class PlaywrightZoomDocsTransport {
     } catch (error) {
       throw new Error(formatBrowserLaunchError(error));
     }
+  }
+
+  private async ensureProfileLockClear(): Promise<void> {
+    const lockPath = singletonLockPath(this.config.userDataDir);
+    const state = await resolveSingletonLockState({ lockPath });
+
+    if (state.kind === 'missing') return;
+
+    if (state.kind === 'stale' || state.kind === 'unparsable') {
+      await removeSingletonLockIfExists(lockPath);
+      writeStderr(
+        state.kind === 'stale'
+          ? `Removed stale browser-profile lock (pid ${state.pid} no longer running).`
+          : `Removed unrecognized browser-profile lock (target: ${state.target}).`
+      );
+      return;
+    }
+
+    throw new Error(
+      `Zoom Docs browser profile at ${this.config.userDataDir} is in use by pid ${state.pid} (host ${state.hostname}). ` +
+        `Quit that process (or run 'kill ${state.pid}') and try again. ` +
+        `If you are sure nothing is running, delete ${lockPath}.`
+    );
   }
 }
