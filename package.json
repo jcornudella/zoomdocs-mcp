@@ -1,6 +1,6 @@
 {
   "name": "@jcornudella/zoomdocs-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Agent-first MCP server for Zoom Docs using a persistent local browser session",
   "author": "Joan Cornudella",
   "license": "MIT",
