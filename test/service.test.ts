@@ -21,6 +21,7 @@ function createMockTransport(): ZoomDocsTransport & {
     ensureLoggedIn: vi.fn(async () => undefined),
     openLogin: vi.fn(async () => ({ alreadyAuthenticated: false })),
     requestJson: requestJson as ZoomDocsTransport['requestJson'] & RequestJsonMock,
+    captureApiResponses: vi.fn(async () => []),
   };
 }
 

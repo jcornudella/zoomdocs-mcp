@@ -493,6 +493,154 @@ async function runMcpServer() {
     }
   );
 
+  server.registerTool(
+    'zoomdocs_discover_search',
+    {
+      title: 'Zoom Docs Discover Search API',
+      description:
+        'Opens Zoom Docs in the local browser and captures every internal API call made during a time window. ' +
+        'Use this to discover the native search endpoint: type a search query in the Zoom Docs window ' +
+        'that opens, then inspect the captured calls to find the right endpoint, request shape, and ' +
+        'response fields (including creator/owner/timestamp metadata). ' +
+        'Once you have the endpoint, use zoomdocs_search_native to call it directly.',
+      inputSchema: {
+        timeout_seconds: z
+          .number()
+          .int()
+          .min(10)
+          .max(120)
+          .optional()
+          .describe(
+            'Capture window in seconds. Defaults to 30. Interact with the Zoom Docs search bar in the browser during this window.'
+          ),
+      },
+    },
+    async ({ timeout_seconds = 30 }) => {
+      const calls = await service.discoverSearch(timeout_seconds * 1000);
+
+      if (calls.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'No API calls captured. Make sure the Zoom Docs browser window opened and you interacted with the search bar during the capture window.',
+            },
+          ],
+          structuredContent: { calls: [] },
+        };
+      }
+
+      const text = calls
+        .map((c) =>
+          [
+            `${c.method} ${c.url} → ${c.status}`,
+            c.requestBody ? `  req: ${c.requestBody.slice(0, 300)}` : null,
+            c.responseKeys.length ? `  res keys: [${c.responseKeys.join(', ')}]` : null,
+            c.responseSnippet ? `  res: ${c.responseSnippet}` : null,
+          ]
+            .filter(Boolean)
+            .join('\n')
+        )
+        .join('\n\n');
+
+      return {
+        content: [{ type: 'text', text }],
+        structuredContent: { calls },
+      };
+    }
+  );
+
+  server.registerTool(
+    'zoomdocs_search_native',
+    {
+      title: 'Zoom Docs Native Search',
+      description:
+        'Search Zoom Docs using the native Zoom search API (POST /api/search/file). ' +
+        'Faster and more powerful than zoomdocs_search — supports full-text search, ' +
+        'author/creator filtering, date ranges, file type filters, and space scoping. ' +
+        'Returns creator and last-updater metadata for each result. ' +
+        'Use zoomdocs_search_users first to resolve person names to user IDs for owner/created_by filtering.',
+      inputSchema: {
+        query: z.string().optional().describe('Search query. Omit or leave empty to match all files (useful with other filters).'),
+        page_size: z.number().int().min(1).max(100).optional().describe('Max results per page. Defaults to 30.'),
+        file_types: z
+          .array(z.enum(['database', 'classicDoc', 'doc', 'page', 'space']))
+          .optional()
+          .describe('File types to include. Defaults to ["database","classicDoc","doc","page"].'),
+        file_filter: z
+          .enum(['FILE_FILTER_DOC', 'FILE_FILTER_MEETING_NOTES', 'FILE_FILTER_DATABASE', 'FILE_FILTER_SUMMARY', 'FILE_FILTER_AGENDA_DOC'])
+          .optional()
+          .describe('Document sub-type filter matching the Zoom Docs UI dropdown.'),
+        ancestor_ids: z.array(z.string()).optional().describe('Scope to specific space or folder IDs.'),
+        owner_ids: z.array(z.string()).optional().describe('Filter by owner user IDs. Use zoomdocs_search_users to resolve names → IDs.'),
+        created_by_user_ids: z.array(z.string()).optional().describe('Filter by creator user IDs. Use zoomdocs_search_users to resolve names → IDs.'),
+        start_last_modify_time: z.string().optional().describe('ISO 8601 timestamp — only return docs modified after this time.'),
+        end_last_modify_time: z.string().optional().describe('ISO 8601 timestamp — only return docs modified before this time.'),
+        title_only: z.boolean().optional().describe('Search titles only (skip full-text content). Defaults to false.'),
+        page_token: z.string().optional().describe('Pagination token from a previous response to fetch the next page.'),
+      },
+    },
+    async ({ query, page_size, file_types, file_filter, ancestor_ids, owner_ids, created_by_user_ids, start_last_modify_time, end_last_modify_time, title_only, page_token }) => {
+      const result = await service.nativeSearch({
+        query,
+        pageSize: page_size,
+        fileTypes: file_types,
+        fileFilters: file_filter ? [file_filter] : undefined,
+        ancestorIds: ancestor_ids,
+        owners: owner_ids,
+        createdByUserIds: created_by_user_ids,
+        startLastModifyTime: start_last_modify_time,
+        endLastModifyTime: end_last_modify_time,
+        titleOnly: title_only,
+        pageToken: page_token,
+      });
+
+      const text =
+        result.items.length === 0
+          ? `No results.${result.totalCount > 0 ? ` (${result.totalCount} total — try broader filters)` : ''}`
+          : [
+              `${result.totalCount} total result(s), showing ${result.items.length}:`,
+              ...result.items.map(
+                (f) =>
+                  `- [${f.fileType}] ${f.title} — ${f.id}` +
+                  (f.createdInfo ? ` | created by ${f.createdInfo.user.displayName} at ${f.createdInfo.time}` : '') +
+                  (f.updatedInfo ? ` | updated by ${f.updatedInfo.user.displayName} at ${f.updatedInfo.time}` : '')
+              ),
+              result.pageToken ? `\nNext page token: ${result.pageToken}` : '',
+            ]
+              .filter(Boolean)
+              .join('\n');
+
+      return {
+        content: [{ type: 'text', text }],
+        structuredContent: { totalCount: result.totalCount, pageToken: result.pageToken, items: result.items },
+      };
+    }
+  );
+
+  server.registerTool(
+    'zoomdocs_search_users',
+    {
+      title: 'Zoom Docs Search Users',
+      description:
+        'Look up Zoom users by name fragment — returns user IDs you can pass to zoomdocs_search_native as owner_ids or created_by_user_ids.',
+      inputSchema: {
+        keyword: z.string().describe('Name fragment to search for, e.g. "marina".'),
+      },
+    },
+    async ({ keyword }) => {
+      const users = await service.lookupUsers(keyword);
+      const text =
+        users.length === 0
+          ? `No users found for "${keyword}".`
+          : [`Users matching "${keyword}":`, ...users.map((u) => `- ${u.displayName} — ${u.userId}`)].join('\n');
+      return {
+        content: [{ type: 'text', text }],
+        structuredContent: { users },
+      };
+    }
+  );
+
   const stdio = new StdioServerTransport();
   await server.connect(stdio);
 
