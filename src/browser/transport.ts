@@ -2,7 +2,7 @@ import { mkdir } from 'node:fs/promises';
 import { chromium, type BrowserContext, type Page } from 'playwright-core';
 
 import type { RuntimeConfig } from '../config.js';
-import type { RequestJsonOptions } from '../zoomdocs/service.js';
+import type { CapturedApiResponse, RequestJsonOptions } from '../zoomdocs/service.js';
 import { collectRememberableNodes, type ZoomDocsNode } from '../zoomdocs/internal-api.js';
 import { buildApiReplayHeaders, buildCandidateDocsOrigins, parseCsrfTokenResponse, toAbsoluteUrl } from './helpers.js';
 
@@ -132,6 +132,65 @@ export class PlaywrightZoomDocsTransport {
     });
 
     return { alreadyAuthenticated: false };
+  }
+
+  async captureApiResponses(timeoutMs: number): Promise<CapturedApiResponse[]> {
+    await this.ensureLoggedIn(false);
+    const page = await this.getPage(false);
+    await page.bringToFront();
+
+    // Navigate to the Zoom Docs root so the user sees the search bar.
+    const baseUrl = this.preferredBaseUrl || this.config.baseUrl;
+    try {
+      if (!page.url().startsWith(baseUrl)) {
+        await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
+      }
+    } catch {
+      // best-effort; if nav fails the page is already somewhere in Zoom Docs
+    }
+
+    const captured: CapturedApiResponse[] = [];
+
+    const handler = async (response: import('playwright-core').Response) => {
+      const url = response.url();
+      if (!url.includes('/api/')) return;
+
+      let requestBody: string | null = null;
+      let responseKeys: string[] = [];
+      let responseSnippet: string | null = null;
+
+      try {
+        requestBody = response.request().postData() || null;
+      } catch {
+        // request may already be GC'd
+      }
+
+      try {
+        const text = await response.text();
+        responseSnippet = text.slice(0, 500);
+        const parsed = JSON.parse(text) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          responseKeys = Object.keys(parsed as Record<string, unknown>);
+        }
+      } catch {
+        // ignore non-JSON or already-consumed responses
+      }
+
+      captured.push({
+        method: response.request().method(),
+        url,
+        requestBody,
+        status: response.status(),
+        responseKeys,
+        responseSnippet,
+      });
+    };
+
+    page.on('response', handler);
+    await new Promise<void>((resolve) => setTimeout(resolve, timeoutMs));
+    page.off('response', handler);
+
+    return captured;
   }
 
   async requestJson<T>(options: RequestJsonOptions): Promise<T> {

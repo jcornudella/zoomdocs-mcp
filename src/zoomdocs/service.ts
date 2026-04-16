@@ -25,10 +25,28 @@ export interface RequestJsonOptions {
   headers?: Record<string, string>;
 }
 
+export interface CapturedApiResponse {
+  method: string;
+  url: string;
+  requestBody: string | null;
+  status: number;
+  /** Top-level keys of the JSON response, useful for quickly spotting relevant fields. */
+  responseKeys: string[];
+  /** First 500 chars of the raw response body. */
+  responseSnippet: string | null;
+}
+
 export interface ZoomDocsTransport {
   ensureLoggedIn(interactive: boolean): Promise<void>;
   openLogin(): Promise<{ alreadyAuthenticated: boolean }>;
   requestJson<T>(options: RequestJsonOptions): Promise<T>;
+  /**
+   * Open the Zoom Docs web app in the local browser and capture every /api/ response
+   * that fires during the given window. Useful for discovering undocumented internal
+   * endpoints — the caller interacts with the UI during the window and then inspects
+   * what was captured.
+   */
+  captureApiResponses(timeoutMs: number): Promise<CapturedApiResponse[]>;
 }
 
 export interface ListResult {
@@ -49,6 +67,46 @@ export interface SearchResult {
   scannedItems: number;
   truncated: boolean;
   items: SearchResultItem[];
+}
+
+export interface NativeSearchParams {
+  query?: string;
+  pageSize?: number;
+  fileTypes?: string[];
+  fileFilters?: string[];
+  ancestorIds?: string[];
+  owners?: string[];
+  createdByUserIds?: string[];
+  startLastModifyTime?: string;
+  endLastModifyTime?: string;
+  titleOnly?: boolean;
+  pageToken?: string;
+}
+
+export interface NativeSearchUser {
+  id: string;
+  displayName: string;
+}
+
+export interface NativeSearchFile {
+  id: string;
+  title: string;
+  fileType: string;
+  parentId?: string;
+  isDeleted?: boolean;
+  createdInfo?: { user: NativeSearchUser; time: string };
+  updatedInfo?: { user: NativeSearchUser; time: string };
+}
+
+export interface NativeSearchResult {
+  items: NativeSearchFile[];
+  pageToken: string;
+  totalCount: number;
+}
+
+export interface UserContact {
+  userId: string;
+  displayName: string;
 }
 
 export interface ReadResult {
@@ -402,6 +460,87 @@ export class ZoomDocsService {
       parentId: resolvedParentId,
       replacedFileId,
     };
+  }
+
+  /**
+   * Open Zoom Docs in the local browser and record every internal API call made
+   * during `timeoutMs` milliseconds. Type a search query in the browser during
+   * this window; the captured calls will reveal the native search endpoint and
+   * its full response shape (including creator/timestamp fields).
+   */
+  async discoverSearch(timeoutMs: number = 30_000): Promise<CapturedApiResponse[]> {
+    return this.transport.captureApiResponses(timeoutMs);
+  }
+
+  /**
+   * Call an internal Zoom Docs API endpoint directly using the authenticated
+   * browser session. Use after `discoverSearch` has identified the right path
+   * and request shape.
+   */
+  async searchNative({
+    path,
+    body,
+    method = 'POST',
+  }: {
+    path: string;
+    body?: unknown;
+    method?: 'GET' | 'POST';
+  }): Promise<unknown> {
+    return this.transport.requestJson<unknown>({ method, path, body });
+  }
+
+  async nativeSearch(params: NativeSearchParams): Promise<NativeSearchResult> {
+    const body: Record<string, unknown> = {
+      pageSize: params.pageSize ?? 30,
+      query: params.query ?? '',
+      fileTypes: params.fileTypes ?? ['database', 'classicDoc', 'doc', 'page'],
+    };
+    if (params.fileFilters?.length) body.fileFilters = params.fileFilters;
+    if (params.ancestorIds?.length) body.ancestorIds = params.ancestorIds;
+    if (params.owners?.length) body.owners = params.owners;
+    if (params.createdByUserIds?.length) body.createdByUserIds = params.createdByUserIds;
+    if (params.startLastModifyTime) body.startLastModifyTime = params.startLastModifyTime;
+    if (params.endLastModifyTime) body.endLastModifyTime = params.endLastModifyTime;
+    if (params.titleOnly !== undefined) body.titleOnly = params.titleOnly;
+    if (params.pageToken) body.pageToken = params.pageToken;
+
+    const raw = await this.transport.requestJson<{
+      items?: Array<{ file?: Record<string, unknown> }>;
+      pageToken?: string;
+      totalCount?: number;
+    }>({ method: 'POST', path: '/api/search/file', body });
+
+    const items: NativeSearchFile[] = (raw.items ?? []).map((entry) => {
+      const f = (entry.file ?? {}) as Record<string, unknown>;
+      const createdInfo = f.createdInfo as { user?: Record<string, unknown>; time?: string } | undefined;
+      const updatedInfo = f.updatedInfo as { user?: Record<string, unknown>; time?: string } | undefined;
+      return {
+        id: String(f.id ?? ''),
+        title: String(f.title ?? ''),
+        fileType: String(f.fileType ?? 'unknown'),
+        parentId: typeof f.parentId === 'string' ? f.parentId : undefined,
+        isDeleted: typeof f.isDeleted === 'boolean' ? f.isDeleted : undefined,
+        createdInfo: createdInfo?.user
+          ? { user: { id: String(createdInfo.user.id ?? ''), displayName: String(createdInfo.user.displayName ?? '') }, time: String(createdInfo.time ?? '') }
+          : undefined,
+        updatedInfo: updatedInfo?.user
+          ? { user: { id: String(updatedInfo.user.id ?? ''), displayName: String(updatedInfo.user.displayName ?? '') }, time: String(updatedInfo.time ?? '') }
+          : undefined,
+      };
+    });
+
+    return { items, pageToken: String(raw.pageToken ?? ''), totalCount: Number(raw.totalCount ?? 0) };
+  }
+
+  async lookupUsers(keyword: string): Promise<UserContact[]> {
+    const raw = await this.transport.requestJson<{
+      users?: Array<{ userId?: unknown; displayName?: unknown }>;
+    }>({ method: 'POST', path: '/api/user/contact', body: { keyword } });
+
+    return (raw.users ?? []).map((u) => ({
+      userId: String(u.userId ?? ''),
+      displayName: String(u.displayName ?? ''),
+    }));
   }
 
   async rename({ fileId, title }: { fileId: string; title: string }): Promise<{ ok: true }> {
