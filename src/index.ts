@@ -367,17 +367,43 @@ function printHelp(): void {
   );
 }
 
+const pendingUpdateNotice: { current: string | null } = { current: null };
+
 async function emitVersionWarningIfOutdated(): Promise<void> {
   if (versionCheckDisabled()) return;
   try {
     const { name: packageName, version: currentVersion } = await readPackageMetadata();
     const result = await runVersionCheck({ packageName, currentVersion });
     if (result.notice) {
+      pendingUpdateNotice.current = result.notice;
       process.stderr.write(`[zoomdocs-mcp] ${result.notice}\n`);
     }
   } catch {
     // Best-effort; never block startup on version-check failures.
   }
+}
+
+type ToolResult = {
+  content: Array<{ type: 'text'; text: string }>;
+  structuredContent?: Record<string, unknown>;
+};
+
+function attachUpdateNoticeIfPending<T extends ToolResult>(result: T): T {
+  const notice = pendingUpdateNotice.current;
+  if (!notice) return result;
+  pendingUpdateNotice.current = null;
+  return {
+    ...result,
+    content: [
+      ...result.content,
+      {
+        type: 'text',
+        text:
+          `\n\n[zoomdocs-mcp update available] ${notice}\n` +
+          `Please tell the user this MCP server is out of date and they need to upgrade it as described above (in most cases: quit Claude Desktop and relaunch it).`,
+      },
+    ],
+  };
 }
 
 async function runMcpServer() {
@@ -393,7 +419,21 @@ async function runMcpServer() {
     version: currentVersion,
   });
 
-  server.registerTool(
+  const registerTool: typeof server.registerTool = ((
+    name: string,
+    config: Parameters<typeof server.registerTool>[1],
+    handler: (args: unknown) => Promise<ToolResult>
+  ) =>
+    server.registerTool(
+      name as Parameters<typeof server.registerTool>[0],
+      config,
+      (async (args: unknown) =>
+        attachUpdateNoticeIfPending(await handler(args))) as Parameters<
+        typeof server.registerTool
+      >[2]
+    )) as typeof server.registerTool;
+
+  registerTool(
     'zoomdocs_login',
     {
       title: 'Zoom Docs Login',
@@ -418,7 +458,7 @@ async function runMcpServer() {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'zoomdocs_status',
     {
       title: 'Zoom Docs Status',
@@ -434,7 +474,7 @@ async function runMcpServer() {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'zoomdocs_search',
     {
       title: 'Zoom Docs Search',
@@ -476,7 +516,7 @@ async function runMcpServer() {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'zoomdocs_list',
     {
       title: 'Zoom Docs List',
@@ -494,7 +534,7 @@ async function runMcpServer() {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'zoomdocs_get_metadata',
     {
       title: 'Zoom Docs Get Metadata',
@@ -512,7 +552,7 @@ async function runMcpServer() {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'zoomdocs_read',
     {
       title: 'Zoom Docs Read',
@@ -531,7 +571,7 @@ async function runMcpServer() {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'zoomdocs_write',
     {
       title: 'Zoom Docs Write',
@@ -563,7 +603,7 @@ async function runMcpServer() {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'zoomdocs_capture_start',
     {
       title: 'Zoom Docs Capture: start',
@@ -598,7 +638,7 @@ async function runMcpServer() {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'zoomdocs_capture_stop',
     {
       title: 'Zoom Docs Capture: stop',
@@ -620,7 +660,7 @@ async function runMcpServer() {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'zoomdocs_capture_status',
     {
       title: 'Zoom Docs Capture: status',
@@ -644,7 +684,7 @@ async function runMcpServer() {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'zoomdocs_delete',
     {
       title: 'Zoom Docs Delete',
@@ -663,7 +703,7 @@ async function runMcpServer() {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'zoomdocs_move',
     {
       title: 'Zoom Docs Move',
@@ -685,7 +725,7 @@ async function runMcpServer() {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'zoomdocs_list_blocks',
     {
       title: 'Zoom Docs List Blocks',
@@ -714,7 +754,7 @@ async function runMcpServer() {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'zoomdocs_append_to_block',
     {
       title: 'Zoom Docs Append To Block',
@@ -740,7 +780,7 @@ async function runMcpServer() {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'zoomdocs_replace_block_text',
     {
       title: 'Zoom Docs Replace Block Text',
@@ -766,7 +806,7 @@ async function runMcpServer() {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'zoomdocs_rename',
     {
       title: 'Zoom Docs Rename',
