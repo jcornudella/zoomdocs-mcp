@@ -4,6 +4,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
+  isChromeProcessCommand,
   parseSingletonLockTarget,
   removeSingletonLockIfExists,
   resolveSingletonLockState,
@@ -72,24 +73,58 @@ describe('resolveSingletonLockState', () => {
     });
   });
 
-  it('reports live when the pid is still running', async () => {
+  it('reports live when the pid is a running chrome process', async () => {
     await withTempDir(async (dir) => {
       const lock = singletonLockPath(dir);
       await symlink('some-host-4242', lock);
       const state = await resolveSingletonLockState({
         lockPath: lock,
         kill: () => undefined,
+        lookupCommand: async () => '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
       });
       expect(state).toEqual({
         kind: 'live',
         target: 'some-host-4242',
         pid: 4242,
         hostname: 'some-host',
+        command: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
       });
     });
   });
 
-  it('treats EPERM as live (process owned by another user)', async () => {
+  it('reports recycled when the pid is alive but not a chrome process', async () => {
+    await withTempDir(async (dir) => {
+      const lock = singletonLockPath(dir);
+      await symlink('some-host-10687', lock);
+      const state = await resolveSingletonLockState({
+        lockPath: lock,
+        kill: () => undefined,
+        lookupCommand: async () => '/bin/zsh',
+      });
+      expect(state).toEqual({
+        kind: 'recycled',
+        target: 'some-host-10687',
+        pid: 10687,
+        hostname: 'some-host',
+        command: '/bin/zsh',
+      });
+    });
+  });
+
+  it('reports recycled when the pid is alive but the command lookup returns nothing', async () => {
+    await withTempDir(async (dir) => {
+      const lock = singletonLockPath(dir);
+      await symlink('some-host-10687', lock);
+      const state = await resolveSingletonLockState({
+        lockPath: lock,
+        kill: () => undefined,
+        lookupCommand: async () => null,
+      });
+      expect(state).toMatchObject({ kind: 'recycled', pid: 10687, command: null });
+    });
+  });
+
+  it('treats EPERM as live only when the command looks like chrome', async () => {
     await withTempDir(async (dir) => {
       const lock = singletonLockPath(dir);
       await symlink('some-host-77', lock);
@@ -100,6 +135,7 @@ describe('resolveSingletonLockState', () => {
           err.code = 'EPERM';
           throw err;
         },
+        lookupCommand: async () => 'chromium --type=renderer',
       });
       expect(state.kind).toBe('live');
     });
@@ -112,6 +148,22 @@ describe('resolveSingletonLockState', () => {
       const state = await resolveSingletonLockState({ lockPath: lock });
       expect(state).toEqual({ kind: 'unparsable', target: 'garbage' });
     });
+  });
+});
+
+describe('isChromeProcessCommand', () => {
+  it('recognizes chrome variants', () => {
+    expect(isChromeProcessCommand('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')).toBe(true);
+    expect(isChromeProcessCommand('chromium --type=renderer')).toBe(true);
+    expect(isChromeProcessCommand('Chrome Helper (Renderer)')).toBe(true);
+    expect(isChromeProcessCommand('node /some/path/playwright-core/browser')).toBe(true);
+  });
+
+  it('rejects unrelated commands', () => {
+    expect(isChromeProcessCommand('/bin/zsh')).toBe(false);
+    expect(isChromeProcessCommand('node')).toBe(false);
+    expect(isChromeProcessCommand('')).toBe(false);
+    expect(isChromeProcessCommand(null)).toBe(false);
   });
 });
 

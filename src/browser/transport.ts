@@ -558,18 +558,24 @@ export class PlaywrightZoomDocsTransport {
 
     if (state.kind === 'missing') return;
 
-    if (state.kind === 'stale' || state.kind === 'unparsable') {
+    if (state.kind === 'stale' || state.kind === 'unparsable' || state.kind === 'recycled') {
       await removeSingletonLockIfExists(lockPath);
-      writeStderr(
-        state.kind === 'stale'
-          ? `Removed stale browser-profile lock (pid ${state.pid} no longer running).`
-          : `Removed unrecognized browser-profile lock (target: ${state.target}).`
-      );
+      if (state.kind === 'stale') {
+        writeStderr(`Removed stale browser-profile lock (pid ${state.pid} no longer running).`);
+      } else if (state.kind === 'recycled') {
+        writeStderr(
+          `Removed browser-profile lock whose pid ${state.pid} belongs to an unrelated process` +
+            (state.command ? ` (${state.command})` : '') +
+            '.'
+        );
+      } else {
+        writeStderr(`Removed unrecognized browser-profile lock (target: ${state.target}).`);
+      }
       return;
     }
 
     throw new Error(
-      `Zoom Docs browser profile at ${this.config.userDataDir} is in use by pid ${state.pid} (host ${state.hostname}). ` +
+      `Zoom Docs browser profile at ${this.config.userDataDir} is in use by pid ${state.pid} (host ${state.hostname}, ${state.command}). ` +
         `Quit that process (or run 'kill ${state.pid}') and try again. ` +
         `If you are sure nothing is running, delete ${lockPath}.`
     );

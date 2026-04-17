@@ -1,9 +1,35 @@
+import { exec } from 'node:child_process';
 import { readlink, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
+import { promisify } from 'node:util';
+
+const execAsync = promisify(exec);
 
 export interface ParsedSingletonLock {
   hostname: string;
   pid: number;
+}
+
+export type CommandLookup = (pid: number) => Promise<string | null>;
+
+const defaultCommandLookup: CommandLookup = async (pid) => {
+  try {
+    const { stdout } = await execAsync(`ps -p ${pid} -o command=`, { timeout: 1500 });
+    const trimmed = stdout.trim();
+    return trimmed || null;
+  } catch {
+    return null;
+  }
+};
+
+export function isChromeProcessCommand(command: string | null): boolean {
+  if (!command) return false;
+  const lower = command.toLowerCase();
+  return (
+    lower.includes('chrome') ||
+    lower.includes('chromium') ||
+    lower.includes('playwright')
+  );
 }
 
 export function parseSingletonLockTarget(target: string): ParsedSingletonLock | null {
@@ -36,17 +62,26 @@ export function isPidAlive(
 export type SingletonLockState =
   | { kind: 'missing' }
   | { kind: 'stale'; target: string; pid: number; hostname: string }
-  | { kind: 'live'; target: string; pid: number; hostname: string }
+  | {
+      kind: 'recycled';
+      target: string;
+      pid: number;
+      hostname: string;
+      command: string | null;
+    }
+  | { kind: 'live'; target: string; pid: number; hostname: string; command: string }
   | { kind: 'unparsable'; target: string };
 
 export async function resolveSingletonLockState({
   lockPath,
   kill,
   readLink = readlink,
+  lookupCommand = defaultCommandLookup,
 }: {
   lockPath: string;
   kill?: (pid: number, signal: number) => void;
   readLink?: (p: string) => Promise<string>;
+  lookupCommand?: CommandLookup;
 }): Promise<SingletonLockState> {
   let target: string;
   try {
@@ -60,12 +95,27 @@ export async function resolveSingletonLockState({
   const parsed = parseSingletonLockTarget(target);
   if (!parsed) return { kind: 'unparsable', target };
 
-  const alive = isPidAlive(parsed.pid, kill);
+  if (!isPidAlive(parsed.pid, kill)) {
+    return { kind: 'stale', target, pid: parsed.pid, hostname: parsed.hostname };
+  }
+
+  const command = await lookupCommand(parsed.pid);
+  if (!isChromeProcessCommand(command)) {
+    return {
+      kind: 'recycled',
+      target,
+      pid: parsed.pid,
+      hostname: parsed.hostname,
+      command,
+    };
+  }
+
   return {
-    kind: alive ? 'live' : 'stale',
+    kind: 'live',
     target,
     pid: parsed.pid,
     hostname: parsed.hostname,
+    command: command as string,
   };
 }
 
