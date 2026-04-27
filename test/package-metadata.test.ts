@@ -22,7 +22,7 @@ describe('package metadata', () => {
     expect(packageJson.keywords).toEqual(
       expect.arrayContaining(['mcp', 'model-context-protocol', 'zoom', 'zoom-docs', 'claude', 'browser-automation'])
     );
-    expect(packageJson.scripts?.verify).toBe('npm test && npm run typecheck && npm run build');
+    expect(packageJson.scripts?.verify).toBe('npm run build && npm test && npm run typecheck');
     expect(packageJson.scripts?.prepublishOnly).toBe('npm run verify');
     expect(packageJson.publishConfig?.access).toBe('public');
     expect(packageJson.bin).toEqual({

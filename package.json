@@ -38,7 +38,7 @@
     "start": "node dist/index.js",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "verify": "npm test && npm run typecheck && npm run build",
+    "verify": "npm run build && npm test && npm run typecheck",
     "prepublishOnly": "npm run verify"
   },
   "dependencies": {
