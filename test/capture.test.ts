@@ -9,6 +9,7 @@ import {
   buildWebSocketRecord,
   defaultCaptureFilePath,
   redactHeaders,
+  redactSensitiveUrl,
   shouldRecordRequest,
   truncateBody,
 } from '../src/zoomdocs/capture.js';
@@ -34,9 +35,32 @@ describe('redactHeaders', () => {
   });
 });
 
+describe('redactSensitiveUrl', () => {
+  it('redacts sensitive query parameters while preserving routing context', () => {
+    expect(
+      redactSensitiveUrl(
+        'wss://us01docs.zoom.us/ws?clientId=abc&auth=jwt-secret&sessionId=session-secret&zm_aid=aid-secret&host=https%3A%2F%2Fus01docs.zoom.us'
+      )
+    ).toBe(
+      'wss://us01docs.zoom.us/ws?clientId=abc&auth=%3Credacted%3E&sessionId=%3Credacted%3E&zm_aid=%3Credacted%3E&host=https%3A%2F%2Fus01docs.zoom.us'
+    );
+  });
+
+  it('redacts repeated sensitive params case-insensitively', () => {
+    expect(redactSensitiveUrl('https://docs.zoom.us/api?Token=a&TOKEN=b&query=keep')).toBe(
+      'https://docs.zoom.us/api?Token=%3Credacted%3E&TOKEN=%3Credacted%3E&query=keep'
+    );
+  });
+
+  it('returns malformed URLs unchanged', () => {
+    expect(redactSensitiveUrl('not a url with token=abc')).toBe('not a url with token=abc');
+  });
+});
+
 describe('shouldRecordRequest', () => {
-  it('matches /api/ requests by default', () => {
+  it('matches /api/ requests and Zoom file uploads by default', () => {
     expect(shouldRecordRequest('https://docs.zoom.us/api/file/my_space')).toBe(true);
+    expect(shouldRecordRequest('https://eu01file.zoom.us/zoomfile/upload?channel=328')).toBe(true);
     expect(shouldRecordRequest('https://docs.zoom.us/static/app.js')).toBe(false);
   });
 
@@ -85,6 +109,7 @@ describe('buildCaptureRecord', () => {
     });
 
     expect(record.method).toBe('POST');
+    expect(record.url).toBe('https://docs.zoom.us/api/search?q=weekly');
     expect(record.pathWithQuery).toBe('/api/search?q=weekly');
     expect(record.requestHeaders.authorization).toBe('<redacted>');
     expect(record.requestHeaders['content-type']).toBe('application/json');
@@ -184,7 +209,7 @@ describe('CaptureRecorder', () => {
       });
 
       await recorder.recordWebSocket({
-        frame: { url: 'wss://us01docs.zoom.us/lynx', direction: 'open', payload: null },
+        frame: { url: 'wss://us01docs.zoom.us/lynx?auth=secret', direction: 'open', payload: null },
       });
 
       await recorder.recordWebSocket({
@@ -219,7 +244,7 @@ describe('CaptureRecorder', () => {
         direction: 'open',
         payload: null,
         payloadEncoding: 'none',
-        url: 'wss://us01docs.zoom.us/lynx',
+        url: 'wss://us01docs.zoom.us/lynx?auth=%3Credacted%3E',
       });
       expect(wsSent).toMatchObject({
         kind: 'websocket',

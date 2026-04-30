@@ -7,6 +7,23 @@ export type DeltaOp =
   | [typeof OP_DELETE, number]
   | [typeof OP_RETAIN, number];
 
+export type SafeStructuralBlockType =
+  | 'BLOCK_TYPE_PARAGRAPH'
+  | 'BLOCK_TYPE_BULLET'
+  | 'BLOCK_TYPE_TODO_LIST'
+  | 'BLOCK_TYPE_HEADING1'
+  | 'BLOCK_TYPE_HEADING2'
+  | 'BLOCK_TYPE_HEADING3'
+  | 'BLOCK_TYPE_HEADING4'
+  | 'BLOCK_TYPE_HEADING5'
+  | 'BLOCK_TYPE_HEADING6';
+
+export interface StructuralBlockSpec {
+  type: SafeStructuralBlockType;
+  text: string;
+  style?: Record<string, unknown>;
+}
+
 export function buildAuthorAttribution(userId: string): string {
   return `26:${JSON.stringify(userId)}`;
 }
@@ -69,17 +86,44 @@ export function buildReplaceDelta({
   return JSON.stringify(ops);
 }
 
+export type BlockTransactionOp =
+  | {
+      command: 'COMMAND_TYPE_UPDATE';
+      blockId: string;
+      args: { delta: string };
+    }
+  | {
+      command: 'COMMAND_TYPE_CREATE';
+      blockId: string;
+      args: {
+        type: string;
+        parentBlockId: string;
+        afterBlockId?: string;
+        content?: { title?: string };
+        style?: Record<string, unknown>;
+      };
+    }
+  | {
+      command: 'COMMAND_TYPE_DELETE';
+      blockId: string;
+    }
+  | {
+      command: 'COMMAND_TYPE_MOVE';
+      blockId: string;
+      args: {
+        fromParentBlockId: string;
+        toParentBlockId: string;
+        afterBlockId?: string;
+      };
+    };
+
 export interface BlockTransactionRequest {
   reqId: string;
   clientId: string;
   baseVersion: number;
   transactions: Array<{
     id: string;
-    ops: Array<{
-      command: 'COMMAND_TYPE_UPDATE';
-      blockId: string;
-      args: { delta: string };
-    }>;
+    ops: BlockTransactionOp[];
   }>;
   extra: { fromFileId: string };
 }
@@ -101,6 +145,37 @@ export function buildBlockTransactionRequest({
   reqId: string;
   transactionId: string;
 }): BlockTransactionRequest {
+  return buildBlockOpsTransactionRequest({
+    fileId,
+    clientId,
+    baseVersion,
+    ops: [
+      {
+        command: 'COMMAND_TYPE_UPDATE',
+        blockId,
+        args: { delta },
+      },
+    ],
+    reqId,
+    transactionId,
+  });
+}
+
+export function buildBlockOpsTransactionRequest({
+  fileId,
+  clientId,
+  baseVersion,
+  ops,
+  reqId,
+  transactionId,
+}: {
+  fileId: string;
+  clientId: string;
+  baseVersion: number;
+  ops: BlockTransactionOp[];
+  reqId: string;
+  transactionId: string;
+}): BlockTransactionRequest {
   return {
     reqId,
     clientId,
@@ -108,16 +183,47 @@ export function buildBlockTransactionRequest({
     transactions: [
       {
         id: transactionId,
-        ops: [
-          {
-            command: 'COMMAND_TYPE_UPDATE',
-            blockId,
-            args: { delta },
-          },
-        ],
+        ops,
       },
     ],
     extra: { fromFileId: fileId },
+  };
+}
+
+export function buildCreateBlockOp({
+  blockId,
+  type,
+  parentBlockId,
+  afterBlockId,
+  text,
+  userId,
+  style,
+}: {
+  blockId: string;
+  type: string;
+  parentBlockId: string;
+  afterBlockId?: string;
+  text: string;
+  userId: string;
+  style?: Record<string, unknown>;
+}): BlockTransactionOp {
+  return {
+    command: 'COMMAND_TYPE_CREATE',
+    blockId,
+    args: {
+      type,
+      parentBlockId,
+      ...(afterBlockId ? { afterBlockId } : {}),
+      ...(text ? { content: { title: buildReplaceDelta({ currentLength: 0, text, userId }) } } : {}),
+      ...(style ? { style } : {}),
+    },
+  };
+}
+
+export function buildDeleteBlockOp({ blockId }: { blockId: string }): BlockTransactionOp {
+  return {
+    command: 'COMMAND_TYPE_DELETE',
+    blockId,
   };
 }
 
@@ -131,6 +237,7 @@ export interface RawBlockSummary {
   content?: {
     title?: unknown;
   };
+  style?: Record<string, unknown>;
 }
 
 export interface BlockSummary {
@@ -140,6 +247,13 @@ export interface BlockSummary {
   seq: string | null;
   version: number;
   text: string;
+}
+
+export interface EditableBlockSnapshot extends BlockSummary {
+  heading?: string;
+  headingLevel?: number;
+  hasInlineContentRisk: boolean;
+  raw: RawBlockSummary;
 }
 
 export function extractPlainTextFromTitle(titleDelta: unknown): string {
@@ -176,6 +290,76 @@ function compareBySeqThenCreatedAt(left: RawBlockSummary, right: RawBlockSummary
   const seqCompare = String(left.seq ?? '').localeCompare(String(right.seq ?? ''));
   if (seqCompare !== 0) return seqCompare;
   return String(left.createdAt ?? '').localeCompare(String(right.createdAt ?? ''));
+}
+
+function isPlainAuthorAttribution(attribute: unknown): boolean {
+  if (attribute == null || attribute === '') return true;
+  return typeof attribute === 'string' && /^26:"[^"]*"$/.test(attribute);
+}
+
+export function titleHasInlineContentRisk(titleDelta: unknown): boolean {
+  if (typeof titleDelta !== 'string' || !titleDelta.trim().startsWith('[')) return false;
+
+  try {
+    const parsed = JSON.parse(titleDelta);
+    if (!Array.isArray(parsed)) return false;
+    return parsed.some((entry) => {
+      if (!Array.isArray(entry) || entry[0] !== OP_INSERT) return false;
+      if (typeof entry[1] !== 'string') return true;
+      return !isPlainAuthorAttribution(entry[2]);
+    });
+  } catch {
+    return false;
+  }
+}
+
+export function headingLevelForBlockType(type: string): number | undefined {
+  const match = type.match(/^BLOCK_TYPE_HEADING_?(\d*)$/);
+  if (!match) return undefined;
+  const level = match[1] ? Number(match[1]) : 1;
+  return Number.isFinite(level) ? level : 1;
+}
+
+export function parseStructuralMarkdown(markdown: string): StructuralBlockSpec[] {
+  const specs: StructuralBlockSpec[] = [];
+
+  for (const rawLine of markdown.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading?.[1] && heading[2]) {
+      specs.push({
+        type: `BLOCK_TYPE_HEADING${heading[1].length}` as SafeStructuralBlockType,
+        text: heading[2].trim(),
+      });
+      continue;
+    }
+
+    const todo = line.match(/^-\s+\[([ xX])]\s*(.*)$/);
+    if (todo) {
+      specs.push({
+        type: 'BLOCK_TYPE_TODO_LIST',
+        text: (todo[2] ?? '').trim(),
+        style: { checked: todo[1]?.toLowerCase() === 'x' },
+      });
+      continue;
+    }
+
+    const bullet = line.match(/^-\s*(.*)$/);
+    if (bullet) {
+      specs.push({ type: 'BLOCK_TYPE_BULLET', text: (bullet[1] ?? '').trim() });
+      continue;
+    }
+
+    specs.push({ type: 'BLOCK_TYPE_PARAGRAPH', text: line });
+  }
+
+  return specs;
+}
+
+export function isHeadingBlockType(type: string): boolean {
+  return headingLevelForBlockType(type) !== undefined;
 }
 
 export function summarizeBlocks(
@@ -224,4 +408,33 @@ export function summarizeBlocks(
   }
 
   return ordered;
+}
+
+export function buildEditableBlockSnapshots(
+  blocks: Record<string, RawBlockSummary> | undefined,
+  options: { rootId?: string } = {}
+): EditableBlockSnapshot[] {
+  const ordered = summarizeBlocks(blocks, options);
+  let currentHeading: { text: string; level: number } | undefined;
+
+  return ordered.flatMap((block) => {
+    const raw = blocks?.[block.id];
+    if (!raw) return [];
+
+    const headingLevel = headingLevelForBlockType(block.type);
+    const snapshot: EditableBlockSnapshot = {
+      ...block,
+      ...(currentHeading ? { heading: currentHeading.text } : {}),
+      ...(headingLevel ? { headingLevel } : {}),
+      hasInlineContentRisk: titleHasInlineContentRisk(raw.content?.title),
+      raw,
+    };
+
+    if (headingLevel) {
+      currentHeading = { text: block.text, level: headingLevel };
+      snapshot.heading = block.text;
+    }
+
+    return [snapshot];
+  });
 }

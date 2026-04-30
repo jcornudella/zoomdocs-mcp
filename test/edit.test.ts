@@ -4,10 +4,15 @@ import {
   buildAppendDelta,
   buildAuthorAttribution,
   buildBlockTransactionRequest,
+  buildCreateBlockOp,
+  buildDeleteBlockOp,
   buildReplaceDelta,
   computeBlockTextLength,
   extractPlainTextFromTitle,
+  headingLevelForBlockType,
+  parseStructuralMarkdown,
   summarizeBlocks,
+  titleHasInlineContentRisk,
 } from '../src/zoomdocs/edit.js';
 
 const USER_ID = 'LudYnENvQQ6KCCKzRJC-Rg';
@@ -62,6 +67,20 @@ describe('extractPlainTextFromTitle', () => {
   });
 });
 
+describe('titleHasInlineContentRisk', () => {
+  it('flags comment marker attributes because replacing the block would orphan inline comments', () => {
+    const title = JSON.stringify([[0, 'Commented text', '26:"user-1"|8:1|thread-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:true']]);
+
+    expect(titleHasInlineContentRisk(title)).toBe(true);
+  });
+
+  it('does not flag plain author attribution', () => {
+    const title = JSON.stringify([[0, 'Plain text', '26:"user-1"']]);
+
+    expect(titleHasInlineContentRisk(title)).toBe(false);
+  });
+});
+
 describe('buildAppendDelta', () => {
   it('produces the retain+insert shape observed in captured traffic', () => {
     const delta = buildAppendDelta({ currentLength: 85, text: ' T', userId: USER_ID });
@@ -97,10 +116,56 @@ describe('buildReplaceDelta', () => {
   });
 });
 
+describe('structural block helpers', () => {
+  it('recognizes both observed heading type spellings', () => {
+    expect(headingLevelForBlockType('BLOCK_TYPE_HEADING2')).toBe(2);
+    expect(headingLevelForBlockType('BLOCK_TYPE_HEADING_2')).toBe(2);
+    expect(headingLevelForBlockType('BLOCK_TYPE_HEADING')).toBe(1);
+    expect(headingLevelForBlockType('BLOCK_TYPE_PARAGRAPH')).toBeUndefined();
+  });
+
+  it('parses the limited safe structural markdown subset into block specs', () => {
+    expect(parseStructuralMarkdown(['## Status', 'Intro paragraph', '- risk', '- [x] done', '- [ ] todo'].join('\n'))).toEqual([
+      { type: 'BLOCK_TYPE_HEADING2', text: 'Status' },
+      { type: 'BLOCK_TYPE_PARAGRAPH', text: 'Intro paragraph' },
+      { type: 'BLOCK_TYPE_BULLET', text: 'risk' },
+      { type: 'BLOCK_TYPE_TODO_LIST', text: 'done', style: { checked: true } },
+      { type: 'BLOCK_TYPE_TODO_LIST', text: 'todo', style: { checked: false } },
+    ]);
+  });
+
+  it('builds create and delete ops with the payload shape used by Zoom block transactions', () => {
+    expect(
+      buildCreateBlockOp({
+        blockId: 'new-block',
+        type: 'BLOCK_TYPE_PARAGRAPH',
+        parentBlockId: 'doc-1',
+        afterBlockId: 'anchor',
+        text: 'Inserted paragraph',
+        userId: USER_ID,
+      })
+    ).toEqual({
+      command: 'COMMAND_TYPE_CREATE',
+      blockId: 'new-block',
+      args: {
+        type: 'BLOCK_TYPE_PARAGRAPH',
+        parentBlockId: 'doc-1',
+        afterBlockId: 'anchor',
+        content: { title: JSON.stringify([[0, 'Inserted paragraph', `26:"${USER_ID}"`]]) },
+      },
+    });
+
+    expect(buildDeleteBlockOp({ blockId: 'old-block' })).toEqual({
+      command: 'COMMAND_TYPE_DELETE',
+      blockId: 'old-block',
+    });
+  });
+});
+
 describe('buildBlockTransactionRequest', () => {
   it('matches the capture payload shape exactly', () => {
     const request = buildBlockTransactionRequest({
-      fileId: 'cPRC6rtoRGCS9X80-SHjQA',
+      fileId: 'doc-captured-payload-shape',
       clientId: 'dd10f56c-b43a-4f12-8284-b14d0e5d973c',
       baseVersion: 644,
       blockId: '6c737ab81d0140ac89b9e01cb042f70f',
@@ -125,7 +190,7 @@ describe('buildBlockTransactionRequest', () => {
           ],
         },
       ],
-      extra: { fromFileId: 'cPRC6rtoRGCS9X80-SHjQA' },
+      extra: { fromFileId: 'doc-captured-payload-shape' },
     });
   });
 });

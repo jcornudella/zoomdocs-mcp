@@ -28,12 +28,35 @@ import {
   PlaywrightZoomDocsTransport,
 } from './browser/transport.js';
 import { defaultCaptureFilePath } from './zoomdocs/capture.js';
+import {
+  formatAccessInfoText,
+  formatAddCommentReactionText,
+  formatAddDocCommentText,
+  formatAddInlineCommentText,
+  formatAddUserCollaboratorText,
+  formatCommentsText,
+  formatDeleteCommentText,
+  formatEditDocBatchText,
+  formatEditDocText,
+  formatEditOutlineText,
+  formatListText,
+  formatMetadataText,
+  formatRemoveUserCollaboratorText,
+  formatReopenCommentThreadText,
+  formatReplyToCommentText,
+  formatResolveCommentThreadText,
+  formatSearchText,
+  formatSetPermissionAccessText,
+  formatSetUserCollaboratorRoleText,
+  formatShareTargetSearchText,
+} from './zoomdocs/format.js';
 import { ZoomDocsService } from './zoomdocs/service.js';
 import { runVersionCheck } from './version-check.js';
 
 const CLAUDE_CONFIG_PATH_ENV = 'ZOOMDOCS_MCP_CLAUDE_CONFIG_PATH';
 const PACKAGE_SPEC_ENV = 'ZOOMDOCS_MCP_PACKAGE_SPEC';
 const VERSION_CHECK_OPT_OUT_ENV = 'ZOOMDOCS_MCP_DISABLE_VERSION_CHECK';
+const DEBUG_TOOLS_ENV = 'ZOOMDOCS_MCP_DEBUG_TOOLS';
 
 let cachedPackageMetadata: { name: string; version: string } | null = null;
 
@@ -62,71 +85,14 @@ function versionCheckDisabled(): boolean {
   return value === '1' || value.toLowerCase() === 'true';
 }
 
+function debugToolsEnabled(): boolean {
+  const value = process.env[DEBUG_TOOLS_ENV];
+  if (!value) return false;
+  return value === '1' || value.toLowerCase() === 'true';
+}
+
 function toStructuredContent(value: unknown): Record<string, unknown> {
   return JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
-}
-
-function formatListText(parentId: string, items: Array<{ id: string; title: string; fileType: string; fileLink?: string }>) {
-  if (items.length === 0) {
-    return `No Zoom Docs children found under ${parentId}.`;
-  }
-
-  return [
-    `Children of ${parentId}:`,
-    ...items.map((item) => `- [${item.fileType}] ${item.title} — ${item.id}${item.fileLink ? ` — ${item.fileLink}` : ''}`),
-  ].join('\n');
-}
-
-function formatSearchText(result: {
-  query: string;
-  pageSize: number;
-  fileTypes: string[];
-  totalReturned: number;
-  items: Array<{
-    id: string;
-    title: string;
-    fileType: string;
-    fileLink: string;
-    titleHighlight?: string;
-    updatedAt?: string;
-    updatedByDisplayName?: string;
-  }>;
-}) {
-  if (result.items.length === 0) {
-    return `No Zoom Docs matches found for "${result.query}" (file types: ${result.fileTypes.join(', ')}).`;
-  }
-
-  return [
-    `Search results for "${result.query}" (${result.totalReturned} of up to ${result.pageSize}):`,
-    ...result.items.map((item) => {
-      const display = item.titleHighlight || item.title;
-      const updatedBits = [
-        item.updatedAt ? `updated ${item.updatedAt}` : undefined,
-        item.updatedByDisplayName ? `by ${item.updatedByDisplayName}` : undefined,
-      ]
-        .filter(Boolean)
-        .join(' ');
-      const trailing = updatedBits ? ` — ${updatedBits}` : '';
-      return `- [${item.fileType}] ${display} — ${item.id} — ${item.fileLink}${trailing}`;
-    }),
-  ].join('\n');
-}
-
-function formatMetadataText(node: {
-  id: string;
-  title: string;
-  fileType: string;
-  fileLink?: string;
-  parentId?: string;
-}) {
-  return [
-    `[${node.fileType}] ${node.title}`,
-    `ID: ${node.id}`,
-    node.parentId ? `Parent: ${node.parentId}` : undefined,
-    node.fileLink ? `Link: ${node.fileLink}` : undefined,
-  ]
-    .filter(Boolean)
-    .join('\n');
 }
 
 async function resolvePackageSpec(): Promise<string> {
@@ -433,6 +399,15 @@ async function runMcpServer() {
       >[2]
     )) as typeof server.registerTool;
 
+  const registerDebugTool: typeof server.registerTool = ((
+    name: string,
+    config: Parameters<typeof server.registerTool>[1],
+    handler: (args: unknown) => Promise<ToolResult>
+  ) => {
+    if (!debugToolsEnabled()) return undefined;
+    return registerTool(name as Parameters<typeof server.registerTool>[0], config, handler as never);
+  }) as typeof server.registerTool;
+
   registerTool(
     'zoomdocs_login',
     {
@@ -553,6 +528,440 @@ async function runMcpServer() {
   );
 
   registerTool(
+    'zoomdocs_get_edit_outline',
+    {
+      title: 'Zoom Docs Get Edit Outline',
+      description:
+        'Read a Zoom Doc structure as agent-friendly editable refs. Use this before zoomdocs_edit_doc when exact text is hard to target; then pass target.by = "ref" with one of the returned refs.',
+      inputSchema: {
+        file_id: z.string().describe('Zoom Docs file ID or URL.'),
+      },
+    },
+    async ({ file_id }) => {
+      const result = await service.getEditOutline({ fileId: file_id });
+      return {
+        content: [{ type: 'text', text: formatEditOutlineText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_get_access_info',
+    {
+      title: 'Zoom Docs Get Access Info',
+      description:
+        'Read sharing, collaborator, link-access, publish-status, and pending permission-request state for a Zoom Doc. This is read-only and should be used before changing permissions.',
+      inputSchema: {
+        file_id: z.string().describe('Zoom Docs file ID or URL.'),
+      },
+    },
+    async ({ file_id }) => {
+      const result = await service.getAccessInfo({ fileId: file_id });
+      return {
+        content: [{ type: 'text', text: formatAccessInfoText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_get_comments',
+    {
+      title: 'Zoom Docs Get Comments',
+      description:
+        'Read open or resolved comments from a Zoom Doc. This is read-only. It extracts inline comment thread refs from the doc content and reads thread/comment data without mutating the document.',
+      inputSchema: {
+        file_id: z.string().describe('Zoom Docs file ID or URL.'),
+        thread_status: z.enum(['open', 'resolved']).optional().describe('Which comment threads to read. Defaults to open.'),
+        thread_id: z.string().optional().describe('Optional exact thread ID to return. Useful after mutations or when a doc has many comments.'),
+      },
+    },
+    async ({ file_id, thread_status, thread_id }) => {
+      const result = await service.getComments({ fileId: file_id, threadStatus: thread_status, threadId: thread_id });
+      return {
+        content: [{ type: 'text', text: formatCommentsText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_add_doc_comment',
+    {
+      title: 'Zoom Docs Add Whole-Doc Comment',
+      description:
+        'Add a whole-doc comment to a Zoom Doc, then read comments back to verify. Supports plain text, explicit mention content parts, and local file attachments. This does not create inline/anchored comments or permission changes.',
+      inputSchema: {
+        file_id: z.string().describe('Exact Zoom Docs file ID or URL.'),
+        text: z.string().optional().describe('Plain-text comment body. Required unless content_parts is provided.'),
+        content_parts: z
+          .array(
+            z.discriminatedUnion('type', [
+              z.object({ type: z.literal('text'), text: z.string() }),
+              z.object({
+                type: z.literal('mention'),
+                user_id: z.string().describe('Explicit Zoom user ID to mention. Resolve with zoomdocs_search_share_targets first.'),
+                name: z.string().describe('Display name for the mention payload.'),
+                notify: z.boolean().optional().describe('Whether Zoom should notify the mentioned user. Defaults to true.'),
+              }),
+            ])
+          )
+          .optional()
+          .describe('Rich comment content parts. Use explicit mention parts instead of free-form @ lookup.'),
+        attachments: z
+          .array(
+            z.object({
+              path: z.string().describe('Local path to upload as a Zoom Docs comment attachment.'),
+              name: z.string().optional().describe('Attachment display name. Defaults to local basename.'),
+              content_type: z.string().optional().describe('MIME type. Inferred from extension when omitted.'),
+            })
+          )
+          .optional()
+          .describe('Local files to upload and attach to the comment.'),
+      },
+    },
+    async ({ file_id, text, content_parts, attachments }) => {
+      const result = await service.addDocComment({
+        fileId: file_id,
+        text,
+        contentParts: content_parts?.map((part) =>
+          part.type === 'mention'
+            ? { type: 'mention', userId: part.user_id, name: part.name, notify: part.notify }
+            : { type: 'text', text: part.text }
+        ),
+        attachments: attachments?.map((attachment) => ({
+          path: attachment.path,
+          name: attachment.name,
+          contentType: attachment.content_type,
+        })),
+      });
+      return {
+        content: [{ type: 'text', text: formatAddDocCommentText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_reply_to_comment',
+    {
+      title: 'Zoom Docs Reply To Comment',
+      description:
+        'Add a plain-text reply to an existing Zoom Docs comment, then read comments back to verify. Requires explicit file_id, thread_id, and parent_comment_id from zoomdocs_get_comments. Does not support mentions or attachments in replies yet.',
+      inputSchema: {
+        file_id: z.string().describe('Exact Zoom Docs file ID or URL.'),
+        thread_id: z.string().describe('Comment thread ID from zoomdocs_get_comments.'),
+        parent_comment_id: z.string().describe('Existing comment ID to reply to, from zoomdocs_get_comments.'),
+        text: z.string().min(1).describe('Plain-text reply body.'),
+        thread_status: z.enum(['open', 'resolved']).optional().describe('Status bucket where the parent comment currently lives. Defaults to open.'),
+      },
+    },
+    async ({ file_id, thread_id, parent_comment_id, text, thread_status }) => {
+      const result = await service.replyToComment({
+        fileId: file_id,
+        threadId: thread_id,
+        parentCommentId: parent_comment_id,
+        text,
+        threadStatus: thread_status,
+      });
+      return {
+        content: [{ type: 'text', text: formatReplyToCommentText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_resolve_comment_thread',
+    {
+      title: 'Zoom Docs Resolve Comment Thread',
+      description:
+        'Resolve an existing Zoom Docs comment thread, then read the resolved comments bucket back to verify. Requires explicit file_id and thread_id from zoomdocs_get_comments.',
+      inputSchema: {
+        file_id: z.string().describe('Exact Zoom Docs file ID or URL.'),
+        thread_id: z.string().describe('Comment thread ID from zoomdocs_get_comments.'),
+      },
+    },
+    async ({ file_id, thread_id }) => {
+      const result = await service.resolveCommentThread({ fileId: file_id, threadId: thread_id });
+      return {
+        content: [{ type: 'text', text: formatResolveCommentThreadText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_reopen_comment_thread',
+    {
+      title: 'Zoom Docs Reopen Comment Thread',
+      description:
+        'Reopen a resolved Zoom Docs comment thread, then read the open comments bucket back to verify. Requires explicit file_id and thread_id from zoomdocs_get_comments. This was replay-verified on a disposable test doc.',
+      inputSchema: {
+        file_id: z.string().describe('Exact Zoom Docs file ID or URL.'),
+        thread_id: z.string().describe('Resolved comment thread ID from zoomdocs_get_comments.'),
+      },
+    },
+    async ({ file_id, thread_id }) => {
+      const result = await service.reopenCommentThread({ fileId: file_id, threadId: thread_id });
+      return {
+        content: [{ type: 'text', text: formatReopenCommentThreadText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_delete_comment',
+    {
+      title: 'Zoom Docs Delete Comment',
+      description:
+        'Delete a non-root Zoom Docs comment/reply, then read comments back to verify it is gone. Requires explicit file_id, thread_id, and comment_id from zoomdocs_get_comments. Root comment / whole-thread deletion is intentionally refused until separately replay-verified.',
+      inputSchema: {
+        file_id: z.string().describe('Exact Zoom Docs file ID or URL.'),
+        thread_id: z.string().describe('Comment thread ID from zoomdocs_get_comments.'),
+        comment_id: z.string().describe('Non-root comment/reply ID to delete, from zoomdocs_get_comments.'),
+        thread_status: z.enum(['open', 'resolved']).optional().describe('Status bucket where the comment currently lives. Defaults to open.'),
+      },
+    },
+    async ({ file_id, thread_id, comment_id, thread_status }) => {
+      const result = await service.deleteComment({
+        fileId: file_id,
+        threadId: thread_id,
+        commentId: comment_id,
+        threadStatus: thread_status,
+      });
+      return {
+        content: [{ type: 'text', text: formatDeleteCommentText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_add_inline_comment',
+    {
+      title: 'Zoom Docs Add Inline Comment',
+      description:
+        'Add an inline/anchored comment to a unique selected substring in one simple editable block, then read comments back to verify. Prefer target.by = ref from zoomdocs_get_edit_outline. Fails closed for ambiguous text or existing inline-rich blocks; if marker insertion fails after thread creation, it resolves the orphan thread before returning ok:false.',
+      inputSchema: {
+        file_id: z.string().describe('Exact Zoom Docs file ID or URL.'),
+        target: z
+          .discriminatedUnion('by', [
+            z.object({
+              by: z.literal('exact_text'),
+              value: z.string().describe('Exact visible block text containing selected_text. No fuzzy matching is applied.'),
+              within_heading: z.string().optional().describe('Optional exact heading text used only to disambiguate repeated visible text.'),
+            }),
+            z.object({
+              by: z.literal('heading'),
+              value: z.string().describe('Exact visible heading text containing selected_text.'),
+            }),
+            z.object({
+              by: z.literal('ref'),
+              value: z.string().describe('Editable ref returned by zoomdocs_get_edit_outline, for example h2:plan/p1.'),
+            }),
+          ])
+          .describe('High-level locator for the block to anchor the inline comment in. Prefer ref; do not pass block IDs.'),
+        selected_text: z.string().min(1).describe('Exact visible substring to anchor the comment to. Must occur exactly once in the matched block.'),
+        text: z.string().min(1).describe('Plain-text comment body. Mentions and attachments are not supported for inline comments yet.'),
+      },
+    },
+    async ({ file_id, target, selected_text, text }) => {
+      const result = await service.addInlineComment({
+        fileId: file_id,
+        target,
+        selectedText: selected_text,
+        text,
+      });
+      return {
+        content: [{ type: 'text', text: formatAddInlineCommentText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_add_comment_reaction',
+    {
+      title: 'Zoom Docs Add Comment Reaction',
+      description:
+        'Add an emoji reaction to an existing Zoom Docs comment, then read comments back to verify. Requires explicit file_id, thread_id, and comment_id from zoomdocs_get_comments.',
+      inputSchema: {
+        file_id: z.string().describe('Exact Zoom Docs file ID or URL.'),
+        thread_id: z.string().describe('Comment thread ID from zoomdocs_get_comments.'),
+        comment_id: z.string().describe('Comment ID from zoomdocs_get_comments.'),
+        reaction: z.string().min(1).describe('Emoji reaction to add, for example 💙.'),
+        thread_status: z.enum(['open', 'resolved']).optional().describe('Status bucket to read back for verification. Defaults to open.'),
+      },
+    },
+    async ({ file_id, thread_id, comment_id, reaction, thread_status }) => {
+      const result = await service.addCommentReaction({
+        fileId: file_id,
+        threadId: thread_id,
+        commentId: comment_id,
+        reaction,
+        threadStatus: thread_status,
+      });
+      return {
+        content: [{ type: 'text', text: formatAddCommentReactionText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_search_share_targets',
+    {
+      title: 'Zoom Docs Search Share Targets',
+      description:
+        'Search Zoom users and channels that can be selected in the Share dialog. This is read-only. Use it to resolve a user_id before inviting a specific collaborator.',
+      inputSchema: {
+        query: z.string().describe('Name or email fragment to search for in Zoom contacts/channels.'),
+      },
+    },
+    async ({ query }) => {
+      const result = await service.searchShareTargets({ query });
+      return {
+        content: [{ type: 'text', text: formatShareTargetSearchText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_set_link_access',
+    {
+      title: 'Zoom Docs Set Link Access',
+      description:
+        'Set account-level or anyone-with-link access for a specific Zoom Doc, then read permissions back to verify. Use zoomdocs_get_access_info first. Requires an explicit file_id/URL and only changes link/account access; it does not invite collaborators, remove collaborators, transfer ownership, or publish the doc.',
+      inputSchema: {
+        file_id: z.string().describe('Exact Zoom Docs file ID or URL. Do not use fuzzy search inside this mutating tool.'),
+        scope: z
+          .enum(['account', 'anyone_with_link'])
+          .describe('Which access scope to change: Zoom account/org access or anyone-with-link access.'),
+        role: z
+          .enum(['noAccess', 'viewer', 'commenter', 'editor'])
+          .describe('Access role to set for the selected scope. Use noAccess to disable link access.'),
+      },
+    },
+    async ({ file_id, scope, role }) => {
+      const result = await service.setPermissionAccess({ fileId: file_id, scope, role });
+      return {
+        content: [{ type: 'text', text: formatSetPermissionAccessText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerDebugTool(
+    'zoomdocs_set_permission_access',
+    {
+      title: 'Zoom Docs Set Permission Access (debug)',
+      description:
+        'DEBUG/replay alias for zoomdocs_set_link_access using the captured Zoom Docs permission endpoint. Kept for endpoint replay/debugging.',
+      inputSchema: {
+        file_id: z.string().describe('Zoom Docs file ID or URL.'),
+        scope: z
+          .enum(['account', 'anyone_with_link'])
+          .describe('Which link-access setting to change: Zoom account/org access or anyone-with-link access.'),
+        role: z
+          .enum(['noAccess', 'viewer', 'commenter', 'editor'])
+          .describe('Access role to set for the selected scope.'),
+      },
+    },
+    async ({ file_id, scope, role }) => {
+      const result = await service.setPermissionAccess({ fileId: file_id, scope, role });
+      return {
+        content: [{ type: 'text', text: formatSetPermissionAccessText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_add_user_collaborator',
+    {
+      title: 'Zoom Docs Add User Collaborator',
+      description:
+        'Invite a specific Zoom user collaborator to a doc, then read permissions back to verify. Requires an explicit file_id and user_id from zoomdocs_search_share_targets. This only adds user collaborators; it does not change org/link access, invite channels, invite external emails, transfer ownership, or publish the doc.',
+      inputSchema: {
+        file_id: z.string().describe('Exact Zoom Docs file ID or URL.'),
+        user_id: z.string().describe('Zoom user ID from zoomdocs_search_share_targets.'),
+        role: z.enum(['viewer', 'commenter', 'editor']).describe('Collaborator role to grant.'),
+        send_email: z.boolean().optional().describe('Whether Zoom should send email notification. Defaults to false.'),
+        send_chat_message: z.boolean().optional().describe('Whether Zoom should send chat notification. Defaults to false.'),
+      },
+    },
+    async ({ file_id, user_id, role, send_email, send_chat_message }) => {
+      const result = await service.addUserCollaborator({
+        fileId: file_id,
+        userId: user_id,
+        role,
+        sendEmail: send_email ?? false,
+        sendChatMessage: send_chat_message ?? false,
+      });
+      return {
+        content: [{ type: 'text', text: formatAddUserCollaboratorText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_set_user_collaborator_role',
+    {
+      title: 'Zoom Docs Set User Collaborator Role',
+      description:
+        'Change the role of an existing Zoom user collaborator on a doc, then read permissions back to verify. Requires an explicit file_id and user_id. This only changes user collaborator roles; it does not change org/link access, invite channels, invite external emails, transfer ownership, or publish the doc.',
+      inputSchema: {
+        file_id: z.string().describe('Exact Zoom Docs file ID or URL.'),
+        user_id: z.string().describe('Zoom user ID whose collaborator role should change.'),
+        role: z.enum(['viewer', 'commenter', 'editor']).describe('New collaborator role.'),
+        is_email_invitee: z.boolean().optional().describe('Whether the target is an email invitee. Defaults to false for normal Zoom users.'),
+      },
+    },
+    async ({ file_id, user_id, role, is_email_invitee }) => {
+      const result = await service.setUserCollaboratorRole({
+        fileId: file_id,
+        userId: user_id,
+        role,
+        isEmailInvitee: is_email_invitee,
+      });
+      return {
+        content: [{ type: 'text', text: formatSetUserCollaboratorRoleText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_remove_user_collaborator',
+    {
+      title: 'Zoom Docs Remove User Collaborator',
+      description:
+        'Remove a specific Zoom user collaborator from a doc, then read permissions back to verify. Requires an explicit file_id and user_id. This only removes user collaborators; it does not change org/link access, remove channels, transfer ownership, or publish the doc.',
+      inputSchema: {
+        file_id: z.string().describe('Exact Zoom Docs file ID or URL.'),
+        user_id: z.string().describe('Zoom user ID to remove from collaborators.'),
+        is_email_invitee: z.boolean().optional().describe('Whether the target is an email invitee. Defaults to false for normal Zoom users.'),
+      },
+    },
+    async ({ file_id, user_id, is_email_invitee }) => {
+      const result = await service.removeUserCollaborator({
+        fileId: file_id,
+        userId: user_id,
+        isEmailInvitee: is_email_invitee,
+      });
+      return {
+        content: [{ type: 'text', text: formatRemoveUserCollaboratorText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
     'zoomdocs_read',
     {
       title: 'Zoom Docs Read',
@@ -572,9 +981,207 @@ async function runMcpServer() {
   );
 
   registerTool(
+    'zoomdocs_create_doc',
+    {
+      title: 'Zoom Docs Create Doc',
+      description: 'Create a brand new Zoom Doc. Never use this to modify an existing doc.',
+      inputSchema: {
+        markdown: z.string().describe('Markdown content to import into the new Zoom Doc.'),
+        title: z.string().optional().describe('New doc title. Defaults to Untitled.'),
+        parent_id: z.string().optional().describe('Parent folder ID or URL. Defaults to my-docs.'),
+      },
+    },
+    async ({ markdown, title, parent_id }) => {
+      const result = await service.createDoc({ markdown, title, parentId: parent_id });
+      return {
+        content: [{ type: 'text', text: `Created Zoom Doc: ${result.file_link || result.file_id}` }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_edit_doc',
+    {
+      title: 'Zoom Docs Edit Doc',
+      description:
+        'Modify an existing Zoom Doc in place and preserve the same fileId/URL when the requested change is supported. Use this for typos, sentence rewrites, paragraph updates, heading text edits, inserting simple blocks after a target, and replacing safe sections under a heading. If the target is missing or ambiguous, this tool returns a structured failure instead of guessing. Use this before creating a replacement copy.',
+      inputSchema: {
+        file_id: z.string().describe('Zoom Docs file ID or URL.'),
+        target: z
+          .discriminatedUnion('by', [
+            z.object({
+              by: z.literal('exact_text'),
+              value: z.string().describe('Exact visible block text to edit. No fuzzy matching is applied.'),
+              within_heading: z
+                .string()
+                .optional()
+                .describe('Optional exact heading text used only to disambiguate repeated visible text.'),
+            }),
+            z.object({
+              by: z.literal('heading'),
+              value: z.string().describe('Exact visible heading text to edit.'),
+            }),
+            z.object({
+              by: z.literal('ref'),
+              value: z.string().describe('Editable ref returned by zoomdocs_get_edit_outline, for example h2:plan/p1.'),
+            }),
+          ])
+          .describe('High-level locator. Prefer ref from zoomdocs_get_edit_outline when exact text is hard to target. Do not pass block IDs.'),
+        operation: z
+          .discriminatedUnion('type', [
+            z.object({
+              type: z.literal('replace_text'),
+              text: z.string().describe('New plain text for the matched block.'),
+            }),
+            z.object({
+              type: z.literal('append_text'),
+              text: z.string().min(1).describe('Plain text to append to the matched block.'),
+            }),
+            z.object({
+              type: z.literal('insert_after'),
+              markdown: z
+                .string()
+                .describe('Safe structural markdown to insert after the matched block. Supports flat headings, paragraphs, bullets, and todo items.'),
+            }),
+            z.object({
+              type: z.literal('replace_section'),
+              markdown: z
+                .string()
+                .describe('Safe structural markdown to replace the content under a matched heading. Supports flat headings, paragraphs, bullets, and todo items.'),
+            }),
+            z.object({
+              type: z.literal('replace_substring'),
+              old_text: z.string().min(1).describe('Exact substring to replace inside the matched block. Must occur exactly once.'),
+              new_text: z.string().describe('Replacement text for old_text.'),
+            }),
+          ])
+          .describe('Single in-place edit operation.'),
+        dry_run: z
+          .boolean()
+          .optional()
+          .describe('Preview the edit and return before/after without applying any changes. Defaults to false.'),
+      },
+    },
+    async ({ file_id, target, operation, dry_run }) => {
+      const result = await service.editDoc({ fileId: file_id, target, operation, dryRun: dry_run });
+      return {
+        content: [{ type: 'text', text: formatEditDocText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_edit_doc_batch',
+    {
+      title: 'Zoom Docs Edit Doc Batch',
+      description:
+        'Apply multiple safe in-place edits to one existing Zoom Doc. The server validates every edit before mutating; if validation fails or two edits target the same block, no changes are applied. Use dry_run first to preview all before/after values, then rerun without dry_run to apply.',
+      inputSchema: {
+        file_id: z.string().describe('Zoom Docs file ID or URL.'),
+        edits: z
+          .array(
+            z.object({
+              target: z
+                .discriminatedUnion('by', [
+                  z.object({
+                    by: z.literal('exact_text'),
+                    value: z.string().describe('Exact visible block text to edit. No fuzzy matching is applied.'),
+                    within_heading: z
+                      .string()
+                      .optional()
+                      .describe('Optional exact heading text used only to disambiguate repeated visible text.'),
+                  }),
+                  z.object({
+                    by: z.literal('heading'),
+                    value: z.string().describe('Exact visible heading text to edit.'),
+                  }),
+                  z.object({
+                    by: z.literal('ref'),
+                    value: z.string().describe('Editable ref returned by zoomdocs_get_edit_outline, for example h2:plan/p1.'),
+                  }),
+                ])
+                .describe('High-level locator. Prefer ref from zoomdocs_get_edit_outline when exact text is hard to target. Do not pass block IDs.'),
+              operation: z
+                .discriminatedUnion('type', [
+                  z.object({
+                    type: z.literal('replace_text'),
+                    text: z.string().describe('New plain text for the matched block.'),
+                  }),
+                  z.object({
+                    type: z.literal('append_text'),
+                    text: z.string().min(1).describe('Plain text to append to the matched block.'),
+                  }),
+                  z.object({
+                    type: z.literal('insert_after'),
+                    markdown: z
+                      .string()
+                      .describe('Safe structural markdown to insert after the matched block. Supports flat headings, paragraphs, bullets, and todo items.'),
+                  }),
+                  z.object({
+                    type: z.literal('replace_section'),
+                    markdown: z
+                      .string()
+                      .describe('Safe structural markdown to replace the content under a matched heading. Supports flat headings, paragraphs, bullets, and todo items.'),
+                  }),
+                  z.object({
+                    type: z.literal('replace_substring'),
+                    old_text: z.string().min(1).describe('Exact substring to replace inside the matched block. Must occur exactly once.'),
+                    new_text: z.string().describe('Replacement text for old_text.'),
+                  }),
+                ])
+                .describe('Single in-place edit operation.'),
+            })
+          )
+          .min(1)
+          .max(25)
+          .describe('Ordered edits to validate and apply. Each mutating edit must target a different block.'),
+        dry_run: z
+          .boolean()
+          .optional()
+          .describe('Preview all edits and return before/after without applying any changes. Defaults to false.'),
+      },
+    },
+    async ({ file_id, edits, dry_run }) => {
+      const result = await service.editDocBatch({ fileId: file_id, edits, dryRun: dry_run });
+      return {
+        content: [{ type: 'text', text: formatEditDocBatchText(result) }],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerTool(
+    'zoomdocs_create_replacement_copy',
+    {
+      title: 'Zoom Docs Create Replacement Copy',
+      description:
+        'Create a new replacement copy of an existing doc. This produces a new fileId and preserves the original. Use only when the user explicitly wants a copy/new doc or when in-place editing is not possible.',
+      inputSchema: {
+        target_file_id: z.string().describe('Existing Zoom Doc ID or URL to copy from. The new file is created as a sibling.'),
+        markdown: z.string().describe('Markdown content for the new replacement copy.'),
+        title: z.string().optional().describe('Replacement copy title. Defaults to the target doc title.'),
+      },
+    },
+    async ({ target_file_id, markdown, title }) => {
+      const result = await service.createReplacementCopy({ targetFileId: target_file_id, markdown, title });
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Created replacement Zoom Doc copy: ${result.file_link || result.file_id}\nOriginal doc preserved: ${result.replaced_file_id}`,
+          },
+        ],
+        structuredContent: toStructuredContent(result),
+      };
+    }
+  );
+
+  registerDebugTool(
     'zoomdocs_write',
     {
-      title: 'Zoom Docs Write',
+      title: 'Zoom Docs Write (legacy/debug)',
       description:
         'Create a Zoom Doc from Markdown using the local browser-authenticated session. Use this when the user asks to create a new Zoom Doc or replace an existing one with drafted content.',
       inputSchema: {
@@ -603,7 +1210,7 @@ async function runMcpServer() {
     }
   );
 
-  registerTool(
+  registerDebugTool(
     'zoomdocs_capture_start',
     {
       title: 'Zoom Docs Capture: start',
@@ -638,7 +1245,7 @@ async function runMcpServer() {
     }
   );
 
-  registerTool(
+  registerDebugTool(
     'zoomdocs_capture_stop',
     {
       title: 'Zoom Docs Capture: stop',
@@ -660,7 +1267,7 @@ async function runMcpServer() {
     }
   );
 
-  registerTool(
+  registerDebugTool(
     'zoomdocs_capture_status',
     {
       title: 'Zoom Docs Capture: status',
@@ -725,7 +1332,7 @@ async function runMcpServer() {
     }
   );
 
-  registerTool(
+  registerDebugTool(
     'zoomdocs_list_blocks',
     {
       title: 'Zoom Docs List Blocks',
@@ -754,7 +1361,7 @@ async function runMcpServer() {
     }
   );
 
-  registerTool(
+  registerDebugTool(
     'zoomdocs_append_to_block',
     {
       title: 'Zoom Docs Append To Block',
@@ -780,12 +1387,12 @@ async function runMcpServer() {
     }
   );
 
-  registerTool(
+  registerDebugTool(
     'zoomdocs_replace_block_text',
     {
       title: 'Zoom Docs Replace Block Text',
       description:
-        'Replace the entire text content of an existing block in a Zoom Doc, in place. Invoke this when the user asks to rewrite, edit, or overwrite a specific paragraph, heading, or list item. Use zoomdocs_list_blocks first to find the right block_id. WARNING: any existing inline objects (attachments, links, mentions) inside that block will be removed; only plain text remains.',
+        'Replace the entire text content of an existing block in a Zoom Doc, in place. Invoke this when the user asks to rewrite, edit, or overwrite a specific paragraph, heading, or list item. Use zoomdocs_list_blocks first to find the right block_id. WARNING: any existing inline annotations or objects (comments, formatting, attachments, links, mentions) inside that block will be removed; only plain text remains.',
       inputSchema: {
         file_id: z.string().describe('Zoom Docs file ID or URL.'),
         block_id: z.string().describe('Block ID inside the doc, from zoomdocs_list_blocks.'),

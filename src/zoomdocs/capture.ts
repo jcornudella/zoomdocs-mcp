@@ -9,7 +9,22 @@ export const DEFAULT_REDACTED_HEADER_NAMES = [
 ] as const;
 
 export const DEFAULT_MAX_BODY_BYTES = 256 * 1024;
-export const DEFAULT_REQUEST_FILTER = '/api/';
+export const DEFAULT_REQUEST_FILTER = /\/api\/|\/zoomfile\/upload/;
+
+export const DEFAULT_REDACTED_QUERY_PARAM_NAMES = [
+  'auth',
+  'token',
+  'access_token',
+  'refresh_token',
+  'id_token',
+  'sessionId',
+  'signature',
+  'zak',
+  'zm_aid',
+  'zm_haid',
+] as const;
+
+const REDACTED_VALUE = '<redacted>';
 
 export interface CaptureRequestInput {
   method: string;
@@ -67,9 +82,27 @@ export function redactHeaders(
   return Object.fromEntries(
     Object.entries(headers).map(([key, value]) => [
       key,
-      lowercased.has(key.toLowerCase()) ? '<redacted>' : value,
+      lowercased.has(key.toLowerCase()) ? REDACTED_VALUE : value,
     ])
   );
+}
+
+export function redactSensitiveUrl(
+  url: string,
+  names: readonly string[] = DEFAULT_REDACTED_QUERY_PARAM_NAMES
+): string {
+  const lowercased = new Set(names.map((name) => name.toLowerCase()));
+
+  try {
+    const parsed = new URL(url);
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      if (!lowercased.has(key.toLowerCase())) continue;
+      parsed.searchParams.set(key, REDACTED_VALUE);
+    }
+    return parsed.toString();
+  } catch {
+    return url;
+  }
 }
 
 export function shouldRecordRequest(url: string, filter: string | RegExp = DEFAULT_REQUEST_FILTER): boolean {
@@ -107,12 +140,13 @@ export function buildCaptureRecord({
   failure?: string;
   maxBodyBytes?: number;
 }): CaptureRecord {
+  const redactedUrl = redactSensitiveUrl(request.url);
   return {
     kind: 'http',
     timestamp,
     method: request.method,
-    url: request.url,
-    pathWithQuery: extractPathWithQuery(request.url),
+    url: redactedUrl,
+    pathWithQuery: extractPathWithQuery(redactedUrl),
     resourceType: request.resourceType,
     requestHeaders: redactHeaders(request.headers),
     requestBody: truncateBody(request.body, maxBodyBytes),
@@ -121,7 +155,7 @@ export function buildCaptureRecord({
     responseHeaders: response ? redactHeaders(response.headers) : {},
     responseBody: truncateBody(response?.body ?? null, maxBodyBytes),
     failure: failure ?? null,
-    fromPageUrl: request.fromPageUrl,
+    fromPageUrl: request.fromPageUrl ? redactSensitiveUrl(request.fromPageUrl) : undefined,
   };
 }
 
@@ -161,14 +195,14 @@ export function buildWebSocketRecord({
   return {
     kind: 'websocket',
     timestamp,
-    url: frame.url,
+    url: redactSensitiveUrl(frame.url),
     direction: frame.direction,
     payload,
     payloadEncoding,
     payloadBytes,
     ...(frame.closeCode !== undefined ? { closeCode: frame.closeCode } : {}),
     ...(frame.closeReason !== undefined ? { closeReason: frame.closeReason } : {}),
-    ...(frame.fromPageUrl !== undefined ? { fromPageUrl: frame.fromPageUrl } : {}),
+    ...(frame.fromPageUrl !== undefined ? { fromPageUrl: redactSensitiveUrl(frame.fromPageUrl) } : {}),
   };
 }
 
